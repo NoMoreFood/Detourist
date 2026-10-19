@@ -1,0 +1,52 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/Build/Temp/x64",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_VERSION": "10.0.26100.0",
+        "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION_MAXIMUM": "10.0.26100.0",
+        "FETCHCONTENT_FULLY_DISCONNECTED": false,
+        "DETOURIST_BUILD_PROFILER": true,
+        "DETOURIST_BUILD_MANAGED_DEBUGGER": true
+      }
+    },
+    {
+      "name": "windows-x86",
+      "inherits": "windows-x64",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/Build/Temp/x86"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x64-release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "jobs": 3
+    },
+    {
+      "name": "x86-release",
+      "configurePreset": "windows-x86",
+      "configuration": "Release",
+      "jobs": 3
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "x64-release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "x86-release",
+      "configurePreset": "windows-x86",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

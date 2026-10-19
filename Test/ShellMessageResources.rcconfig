@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<localization>
+  <resources>
+    <win32Resources fileType="Application" ultimateFallbackLanguage="en-US">
+      <neutralResources><resourceType typeNameId="#10" /></neutralResources>
+      <localizedResources><resourceType typeNameId="#6" /></localizedResources>
+    </win32Resources>
+  </resources>
+</localization>

@@ -1,0 +1,4 @@
+LIBRARY shell32.dll
+EXPORTS
+    OrdinalDisconnectWindowDialog @254 NONAME
+    OrdinalUnregisterClass @259 NONAME

@@ -1,0 +1,17 @@
+LIBRARY DetouristAgent
+EXPORTS
+    DetouristStart=_DetouristStart@4
+    DetouristStartInstructions=_DetouristStartInstructions@4
+    DetouristAsyncCallback=_DetouristAsyncCallback@24
+    DetouristCaptureStack=_DetouristCaptureStack@24
+    DetouristObserveRpcMarshaler=_DetouristObserveRpcMarshaler@16
+    DetouristRpcMarshalerOriginal=_DetouristRpcMarshalerOriginal@8
+    DetouristRpcMarshalerOwns=_DetouristRpcMarshalerOwns@12
+    DetouristRpcSerializationOperation=_DetouristRpcSerializationOperation@8
+    DetouristObserveRpcSerialization=_DetouristObserveRpcSerialization@20
+    DetouristGetProfilerBridge=_DetouristGetProfilerBridge@8
+    DetouristGetObserverContext=_DetouristGetObserverContext@4
+    DetouristSetObserverContext=_DetouristSetObserverContext@4
+    DetouristNativeHookAddresses DATA
+    DetouristNativeHookApis DATA
+    DetouristInternalCallerRanges DATA

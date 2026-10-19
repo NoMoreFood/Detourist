@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup Condition="'$(DetouristBuildDirectory)' == ''">
+    <DetouristBuildDirectory>$(MSBuildThisFileDirectory)Build/Temp/x64</DetouristBuildDirectory>
+  </PropertyGroup>
+  <PropertyGroup>
+    <DetouristDotnetRoot>$(DetouristBuildDirectory)/dotnet</DetouristDotnetRoot>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(BaseOutputPath)' == ''">
+    <BaseOutputPath>$(DetouristDotnetRoot)/bin/$(MSBuildProjectName)/</BaseOutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(BaseIntermediateOutputPath)' == ''">
+    <BaseIntermediateOutputPath>$(DetouristDotnetRoot)/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>

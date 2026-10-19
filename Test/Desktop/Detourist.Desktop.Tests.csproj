@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>14</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Source/Detourist.Desktop/Detourist.Desktop.csproj" />
+  </ItemGroup>
+  <Target Name="CopyCaptureFixtures" AfterTargets="Build" Condition="'$(DetouristNativeDir)' != ''">
+    <ItemGroup>
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristCollector.exe" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristAgent.dll" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristSpy64.dll" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristWindowSpyTarget.exe" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristTestTarget.exe" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristWin32Tests.exe" />
+      <CaptureFixture Include="$(DetouristNativeDir)/ApiCatalog.sqlite;$(DetouristNativeDir)/DetouristSqlite.dll" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristProfiler.dll"
+        Condition="Exists('$(DetouristNativeDir)/DetouristProfiler.dll')" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristComTarget.exe" />
+      <CaptureFixture Include="$(DetouristNativeDir)/DetouristInstructions.dll"
+        Condition="Exists('$(DetouristNativeDir)/DetouristInstructions.dll')" />
+      <CaptureFixture Include="$(DetouristNativeDir)/drmgr.dll;$(DetouristNativeDir)/drwrap.dll"
+        Condition="Exists('$(DetouristNativeDir)/DetouristInstructions.dll')" />
+      <InstructionRuntime Include="$(DetouristNativeDir)/instruction/**/*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CaptureFixture)" DestinationFolder="$(OutDir)" />
+    <Copy SourceFiles="@(InstructionRuntime)"
+      DestinationFiles="@(InstructionRuntime->'$(OutDir)instruction/%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+</Project>

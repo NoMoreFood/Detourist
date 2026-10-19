@@ -1,0 +1,15 @@
+[
+    uuid(3a1d0f7a-a626-4d08-9eb9-b085fab353c8),
+    version(1.0),
+    pointer_default(unique)
+]
+interface DetouristRpcLegacy
+{
+    long DetouristRpcLegacyValues(
+        [in] handle_t binding,
+        [in] long value,
+        [in] hyper wide,
+        [in, string] wchar_t* text,
+        [in, out] long* changed,
+        [out] long* output);
+}

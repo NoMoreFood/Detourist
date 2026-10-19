@@ -1,0 +1,5 @@
+interface @DETOURIST_RPC_NAME@
+{
+    [async] @DETOURIST_RPC_NAME@Async();
+    [encode, decode] @DETOURIST_RPC_NAME@Pickle();
+}

@@ -1,0 +1,125 @@
+[
+    uuid(@DETOURIST_RPC_UUID@),
+    version(1.0),
+    pointer_default(unique)
+]
+interface @DETOURIST_RPC_NAME@
+{
+    typedef struct @DETOURIST_RPC_NAME@Record
+    {
+        long number;
+        hyper large;
+        [string] wchar_t* label;
+    } @DETOURIST_RPC_NAME@Record;
+
+    long @DETOURIST_RPC_NAME@Values(
+        [in] handle_t binding,
+        [in] long signedValue,
+        [in] unsigned hyper wideValue,
+        [in] double floatingValue,
+        [in, string] wchar_t* text,
+        [in, unique] long* optional,
+        [in, out] long* changed);
+
+    long @DETOURIST_RPC_NAME@Buffers(
+        [in] handle_t binding,
+        [in] unsigned long count,
+        [in, size_is(count)] byte* input,
+        [in] unsigned long capacity,
+        [out, size_is(capacity), length_is(*written)] byte* output,
+        [out] unsigned long* written,
+        [in, out] @DETOURIST_RPC_NAME@Record* record);
+
+    // The NDR64 fixture deliberately excludes DCE to exercise the NDR64 async stub.
+    midl_pragma warning(disable: 2440)
+    long @DETOURIST_RPC_NAME@Async(
+        [in] handle_t binding,
+        [in, string] char* text,
+        [out] long* result);
+    midl_pragma warning(default: 2440)
+
+    void @DETOURIST_RPC_NAME@Pickle(
+        [in, out] long* value,
+        [in, out, string] wchar_t** text);
+
+    long @DETOURIST_RPC_NAME@Records(
+        [in] handle_t binding,
+        [in] unsigned long count,
+        [in, out, size_is(count)] @DETOURIST_RPC_NAME@Record* records);
+
+    typedef [wire_marshal(long)] struct @DETOURIST_RPC_NAME@Custom
+    {
+        long number;
+        long complement;
+    } @DETOURIST_RPC_NAME@Custom;
+
+    long @DETOURIST_RPC_NAME@Marshaled(
+        [in] handle_t binding,
+        [in] @DETOURIST_RPC_NAME@Custom prior,
+        [in, out] @DETOURIST_RPC_NAME@Custom* value);
+
+    typedef [switch_type(long)] union @DETOURIST_RPC_NAME@Choice
+    {
+        [case(1)] long number;
+        [case(2)] [string] wchar_t* text;
+        [case(-1)] hyper wide;
+        [default] ;
+    } @DETOURIST_RPC_NAME@Choice;
+
+    typedef union switch(short tag) value
+    {
+        case 1: long number;
+        case 2: [string] wchar_t* text;
+        default: hyper wide;
+    } @DETOURIST_RPC_NAME@Envelope;
+
+    long @DETOURIST_RPC_NAME@Unions(
+        [in] handle_t binding,
+        [in] long tag,
+        [in, out, switch_is(tag)] @DETOURIST_RPC_NAME@Choice* choice,
+        [in, out] @DETOURIST_RPC_NAME@Envelope* envelope);
+
+    long @DETOURIST_RPC_NAME@Expressions(
+        [in] handle_t binding,
+        [in] unsigned long count,
+        [in] unsigned long extra,
+        [in, size_is(count * 3 + extra)] byte* input,
+        [in] unsigned long capacity,
+        [out, size_is(capacity * 2 + 1), length_is(*written)] byte* output,
+        [out] unsigned long* written);
+
+    typedef struct @DETOURIST_RPC_NAME@Bundle
+    {
+        unsigned long count;
+        [size_is(count)] byte* values;
+        long tag;
+        [switch_is(tag)] @DETOURIST_RPC_NAME@Choice choice;
+    } @DETOURIST_RPC_NAME@Bundle;
+
+    long @DETOURIST_RPC_NAME@Nested(
+        [in] handle_t binding,
+        [in, out] @DETOURIST_RPC_NAME@Bundle* value);
+
+    typedef [wire_marshal(long)] struct @DETOURIST_RPC_NAME@OutputCustom
+    {
+        long number;
+        long complement;
+    } @DETOURIST_RPC_NAME@OutputCustom;
+
+    typedef [switch_type(long)] union @DETOURIST_RPC_NAME@MarshaledChoice
+    {
+        [case(1)] @DETOURIST_RPC_NAME@OutputCustom value;
+        [default] long number;
+    } @DETOURIST_RPC_NAME@MarshaledChoice;
+
+    typedef struct @DETOURIST_RPC_NAME@MarshaledBundle
+    {
+        long tag;
+        [switch_is(tag)] @DETOURIST_RPC_NAME@MarshaledChoice choice;
+    } @DETOURIST_RPC_NAME@MarshaledBundle;
+
+    long @DETOURIST_RPC_NAME@MarshaledOutput(
+        [in] handle_t binding,
+        [in] unsigned long count,
+        [out, size_is(count)] @DETOURIST_RPC_NAME@MarshaledBundle* values);
+}

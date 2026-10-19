@@ -1,0 +1,4 @@
+EXPORTS
+    SpySent=_SpySent@12
+    SpyReturned=_SpyReturned@12
+    SpyPosted=_SpyPosted@12

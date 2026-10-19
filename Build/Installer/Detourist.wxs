@@ -1,0 +1,27 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Detourist" Manufacturer="Detourist" Version="$(ProductVersion)"
+           UpgradeCode="8E9ACB8D-15B3-48FC-8DD2-684F8B9CECB7" Scope="perMachine" Language="1033">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Detourist is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="Complete" Title="Detourist" Level="1">
+      <ComponentGroupRef Id="ApplicationFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Detourist" />
+    </StandardDirectory>
+    <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.Payload)\**">
+        <Exclude Files="!(bindpath.Payload)\Detourist.exe" />
+      </Files>
+      <Component Id="DesktopApplication">
+        <File Id="DesktopExecutable" Source="!(bindpath.Payload)\Detourist.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Detourist"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

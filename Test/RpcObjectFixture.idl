@@ -1,0 +1,14 @@
+import "unknwn.idl";
+
+[
+    object,
+    uuid(a01cfdea-4564-47dc-92d4-b604c8ffcc9f),
+    async_uuid(b851663e-3d68-4133-9502-c7e494515ad4),
+    pointer_default(unique)
+]
+interface IDetouristRpcProbe : IUnknown
+{
+    HRESULT Value([in] long number, [out] long* changed);
+    HRESULT Mix([in] double fraction, [in] hyper wide, [in] long first, [in] long second,
+        [in] long third, [in, string] const wchar_t* text, [out] hyper* total);
+}

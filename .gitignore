@@ -1,0 +1,14 @@
+/Build/Temp/
+/Build/Output/
+/Build/PackageStage/
+/.dependencies/
+/.vs/
+**/bin/
+**/obj/
+*.obj
+*.user
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[co]

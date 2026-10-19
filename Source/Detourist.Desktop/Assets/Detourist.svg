@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+    <title>Detourist</title>
+    <rect x="2" y="2" width="60" height="60" rx="11" fill="#202934" stroke="#405164" stroke-width="1.5" />
+    <path d="M18 16 H33 L48 27 V37 L33 48 H18 Z" fill="none" stroke="#E8EFF7" stroke-width="6"
+          stroke-linejoin="round" />
+    <path d="M9 33 H25 L34 24 H44" fill="none" stroke="#539BDB" stroke-width="6"
+          stroke-linejoin="round" />
+    <path d="M41 18 L49 24 L41 30 Z" fill="#539BDB" />
+</svg>

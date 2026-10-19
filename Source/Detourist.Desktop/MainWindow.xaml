@@ -1,0 +1,528 @@
+<Window x:Class="Detourist.Desktop.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:Detourist.Desktop"
+        Title="Detourist" Width="1540" Height="920" MinWidth="1100" MinHeight="620"
+        Style="{StaticResource {x:Type Window}}" WindowStartupLocation="CenterScreen" Loaded="WindowLoaded"
+        Closing="WindowClosing" AllowDrop="True" Drop="WindowDrop" PreviewKeyDown="WindowKeyDown">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+            <RowDefinition Height="*" /><RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Border Background="{StaticResource RaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1" Padding="8,5">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Content="_Window Spy…" Click="OpenWindowSpy" Margin="0,0,5,0"
+                            ToolTip="Inspect windows, processes, threads and window messages" />
+                    <Button Content="Catalo_g…" Click="OpenCatalog" Margin="0,0,5,0"
+                            ToolTip="Browse and edit the API catalog" />
+                    <Button Content="E_xports…" Click="InspectDll" Margin="0,0,5,0" ToolTip="Inspect DLL exports" />
+                    <Button x:Name="SettingsButton" Content="Se_ttings…" Click="OpenSettings" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="OpenButton" Content="_Open trace…" Click="OpenTrace" Margin="0,0,1,0"
+                            ToolTip="Open a saved trace (Ctrl+O)" />
+                    <Button x:Name="RecentTracesButton" Content="▾" Click="ShowRecentTraces" Padding="6,4"
+                            Margin="0,0,8,0" ToolTip="Recent traces and the trace folder"
+                            AutomationProperties.Name="Recent traces" />
+                    <Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0" Margin="0,2,8,2" />
+                    <Button x:Name="LaunchButton" Content="_Launch…" Style="{StaticResource PrimaryButton}"
+                            Click="LaunchProcess" Margin="0,0,1,0" />
+                    <Button x:Name="RecentTargetsButton" Content="▾" Style="{StaticResource PrimaryButton}"
+                            Click="ShowRecentTargets" Padding="6,4" Margin="0,0,5,0"
+                            ToolTip="Launch a recent application again (Ctrl+R repeats the last launch)"
+                            AutomationProperties.Name="Recent applications" />
+                    <Button x:Name="AttachButton" Content="_Attach…" Click="AttachProcess" Margin="0,0,5,0" />
+                    <Button x:Name="CaptureModeButton" Content="Capture mode ▾" Click="ShowCaptureModes"
+                            ToolTip="Choose engine, stacks and capture scope for the next launch or attach" />
+                    <Button x:Name="PauseButton" Content="_Pause" Click="PauseCapture" Margin="0,0,5,0"
+                            Visibility="Collapsed" />
+                    <Button x:Name="StopButton" Content="_Stop" Click="StopCapture" Visibility="Collapsed" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+        <Border Grid.Row="1" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="10,6">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="0.9*" /><ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
+                    <Ellipse x:Name="StateDot" Fill="{StaticResource MutedBrush}" Width="6" Height="6" Margin="0,0,7,0"
+                        />
+                    <TextBlock x:Name="StateText" Text="IDLE" FontSize="11" FontWeight="SemiBold"
+                               Foreground="{StaticResource MutedBrush}" />
+                </StackPanel>
+                <Grid Grid.Column="1" Margin="0,0,14,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="SessionTitle" Text="No capture session" FontWeight="SemiBold"
+                               TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, ElementName=SessionSubtitle}" />
+                    <TextBlock x:Name="SessionSubtitle" Text="Launch or attach a process to capture API calls."
+                               Visibility="Collapsed" />
+                </Grid>
+                <Button Grid.Column="2" x:Name="CaptureFiltersButton" Click="OpenCaptureFilters" Visibility="Collapsed"
+                        Style="{StaticResource FlatButton}" Padding="6,0" MinHeight="20" FontSize="11"
+                        Margin="0,0,10,0" MaxWidth="520"
+                        AutomationProperties.Name="{Binding Text, ElementName=CaptureFiltersText}"
+                        ToolTip="Capture filters and breakpoints in effect. Opens capture settings.">
+                    <TextBlock x:Name="CaptureFiltersText" Foreground="{StaticResource AccentBrush}"
+                               TextTrimming="CharacterEllipsis" />
+                </Button>
+                <TextBlock Grid.Column="3" x:Name="CoverageText" Text="Connecting to capture service…"
+                           Style="{StaticResource Muted}" FontSize="11" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis" />
+                <Button Grid.Column="4" x:Name="CoverageButton" Content="Coverage…" Click="ShowCoverage"
+                        Visibility="Collapsed" Style="{StaticResource FlatButton}" Padding="6,0"
+                        MinHeight="20" FontSize="11" Margin="8,0,0,0" />
+            </Grid>
+        </Border>
+        <Border Grid.Row="2" x:Name="ErrorBanner" Background="#382629" BorderBrush="#714144"
+                BorderThickness="0,1" Padding="10,5" Visibility="Collapsed">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="×" Click="DismissError" MinHeight="20" Padding="6,0"
+                        Style="{StaticResource FlatButton}" AutomationProperties.Name="Dismiss error" />
+                <TextBlock x:Name="ErrorText" TextWrapping="Wrap" Foreground="{StaticResource DangerBrush}"
+                           VerticalAlignment="Center" />
+            </DockPanel>
+        </Border>
+        <Grid Grid.Row="3" Margin="8,6,8,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="540" /><ColumnDefinition Width="5" />
+                <ColumnDefinition x:Name="InspectorColumn" Width="440" MinWidth="350" />
+            </Grid.ColumnDefinitions>
+            <Border Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" /><RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <DockPanel Background="#292B30" Margin="0">
+                        <Button x:Name="ColumnsButton" DockPanel.Dock="Right" Content="_Columns…"
+                                Click="ChooseColumns" Margin="0,2,5,2" MinHeight="22" Padding="7,0"
+                                ToolTip="Show or hide call columns; drag headers to reorder." />
+                        <Button x:Name="FindButton" DockPanel.Dock="Right" Content="Fi_nd" Click="ShowFind"
+                                Margin="0,2,5,2" MinHeight="22" Padding="7,0"
+                                ToolTip="Find calls without hiding the others (Ctrl+F, then F3 and Shift+F3)" />
+                        <Button x:Name="ResetFilterButton" DockPanel.Dock="Right" Content="Reset filters"
+                                Click="ClearDisplayFilters" Margin="0,2,5,2" MinHeight="22" Padding="7,0"
+                                Visibility="Collapsed" ToolTip="Clear all display filters" />
+                        <ComboBox x:Name="OrderCombo" DockPanel.Dock="Right" DisplayMemberPath="Label" Width="118"
+                                  Margin="0,2,5,2" MinHeight="22" SelectionChanged="OrderChanged"
+                                  AutomationProperties.Name="Call order"
+                                  ToolTip="Order of calls. Slowest first ranks matching calls by elapsed time." />
+                        <CheckBox x:Name="FollowCheck" DockPanel.Dock="Right" Content="_Follow newest" IsChecked="True"
+                                  Margin="8,4" Checked="FollowChanged" Unchecked="FollowChanged" Visibility="Collapsed"
+                                  ToolTip="Keep the newest calls in view during capture. Selecting or scrolling to a call pauses following." />
+                        <DockPanel Margin="8,5">
+                            <TextBlock Text="API calls" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <CheckBox x:Name="SummaryCheck" Content="S_ummary" Margin="12,0,0,0"
+                                      Checked="SummaryChanged" Unchecked="SummaryChanged"
+                                      ToolTip="Total the listed calls by API: counts, failures and time." />
+                            <TextBlock x:Name="ResultsText" Style="{StaticResource Muted}" FontSize="11"
+                                       Margin="10,0,0,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                       ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                        </DockPanel>
+                    </DockPanel>
+                    <Grid Grid.Row="1" x:Name="FilterBar" Margin="6">
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto"
+                            /></Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="180" /><ColumnDefinition Width="125" />
+                            <ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ComboBox x:Name="ProcessCombo" DisplayMemberPath="Label" SelectionChanged="FilterChanged"
+                                  Margin="0,0,5,0" AutomationProperties.Name="Process filter"
+                                  ToolTip="{Binding SelectedItem.Label, RelativeSource={RelativeSource Self}}" />
+                        <ComboBox Grid.Column="1" x:Name="ThreadCombo" DisplayMemberPath="Label" Width="120"
+                                  HorizontalAlignment="Right" Margin="0,0,5,0" SelectionChanged="FilterChanged"
+                                  AutomationProperties.Name="Thread filter"
+                                  ToolTip="{Binding SelectedItem.Label, RelativeSource={RelativeSource Self}}" />
+                        <Grid Grid.Column="2" x:Name="SearchPanel" Margin="0,0,5,0">
+                            <TextBox x:Name="ApiSearch" TextChanged="SearchChanged" Padding="6,3,46,3"
+                                     PreviewKeyDown="SearchKeyDown" LostKeyboardFocus="SearchLostFocus"
+                                     AutomationProperties.Name="Filter calls">
+                                <TextBox.ToolTip>
+                                    <TextBlock FontFamily="Consolas">
+                                        <Run Text="Terms combine; a leading - excludes. Ctrl+L focuses, Esc clears."
+                                            /><LineBreak />
+                                        <LineBreak />
+                                        <Run Text="CreateFile              name contains" /><LineBreak />
+                                        <Run Text="=CreateFileW            exact name" /><LineBreak />
+                                        <Run Text="Nt*File                 * matches any run" /><LineBreak />
+                                        <Run Text="ntdll!  kernel32!Nt*    module, or module and name" /><LineBreak />
+                                        <Run Text="ReadFile|WriteFile      either" /><LineBreak />
+                                        <Run Text="tid:1234  pid:  id:     thread, process, call" /><LineBreak />
+                                        <Run Text="result:0xC0000034       return value" /><LineBreak />
+                                        <Run Text="error:5                 thread LastError" /><LineBreak />
+                                        <Run Text="duration&gt;1ms            elapsed time" /><LineBreak />
+                                        <Run Text="adjusted&gt;1ms            excludes capture work" /><LineBreak />
+                                        <Run Text="depth:0                 top-level calls" /><LineBreak />
+                                        <Run Text="caller:0x7FF6…-0x7FF7…  caller address or range" /><LineBreak />
+                                        <Run Text="text:hosts              captured strings" /><LineBreak />
+                                        <Run Text="arg:0x1A4               argument value" /><LineBreak />
+                                        <Run Text="value:0x1A4             argument or return value" /><LineBreak />
+                                        <Run Text="from:app  from:user32   module that made the call" /><LineBreak />
+                                        <Run Text="after:2.5  before:10    seconds since the capture started"
+                                            /><LineBreak />
+                                        <Run Text="under:1.5321            calls nested in a call (process.call)"
+                                            /><LineBreak />
+                                        <Run Text="parent:1.5321           direct children of a call" /><LineBreak />
+                                        <Run Text="&quot;two words&quot;             quotes keep spaces" />
+                                    </TextBlock>
+                                </TextBox.ToolTip>
+                            </TextBox>
+                            <TextBlock Text="Filter calls: name, module!name, -exclude, tid:, text:, duration&gt;…"
+                                       Margin="9,0,46,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                       IsHitTestVisible="False" Foreground="{StaticResource MutedBrush}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                        <Style.Triggers>
+                                            <MultiDataTrigger>
+                                                <MultiDataTrigger.Conditions>
+                                                    <Condition Binding="{Binding Text, ElementName=ApiSearch}"
+                                                        Value="" />
+                                                    <Condition Binding="{Binding IsKeyboardFocusWithin,
+                                                        ElementName=ApiSearch}" Value="False" />
+                                                </MultiDataTrigger.Conditions>
+                                                <Setter Property="Visibility" Value="Visible" />
+                                            </MultiDataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <Button x:Name="FilterMenuButton" Content="▾" Click="ShowFilterMenu" Width="22"
+                                    HorizontalAlignment="Right" Style="{StaticResource FlatButton}"
+                                    Padding="0" MinHeight="20" Margin="1" ToolTip="Quick, saved and recent filters"
+                                    AutomationProperties.Name="Quick, saved and recent filters" />
+                            <Popup x:Name="SuggestPopup" PlacementTarget="{Binding ElementName=ApiSearch}"
+                                   Placement="Bottom" StaysOpen="True" Focusable="False">
+                                <ListBox x:Name="SuggestList" Focusable="False" MaxHeight="230" MinWidth="300"
+                                         Background="{StaticResource RaisedBrush}"
+                                         Foreground="{StaticResource TextBrush}"
+                                         BorderBrush="{StaticResource BorderBrush}" FontFamily="Consolas" FontSize="12"
+                                         PreviewMouseLeftButtonDown="SuggestionClicked"
+                                         AutomationProperties.Name="Filter suggestions">
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="ListBoxItem">
+                                            <Setter Property="Focusable" Value="False" />
+                                            <Setter Property="Template"><Setter.Value><ControlTemplate
+                                                TargetType="ListBoxItem">
+                                                <Border x:Name="Chrome" Background="Transparent" Padding="7,3">
+                                                    <ContentPresenter />
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True"><Setter
+                                                        TargetName="Chrome" Property="Background" Value="#34373D"
+                                                        /></Trigger>
+                                                    <Trigger Property="IsSelected" Value="True"><Setter
+                                                        TargetName="Chrome" Property="Background" Value="#294964"
+                                                        /></Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate></Setter.Value></Setter>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="{Binding Text}" MinWidth="150" />
+                                                <TextBlock Text="{Binding Hint}"
+                                                    Foreground="{StaticResource MutedBrush}"
+                                                           Margin="12,0,0,0" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </Popup>
+                            <Button x:Name="ClearSearchButton" Content="×" Click="ClearApiSearch" Width="22"
+                                    HorizontalAlignment="Right"
+                                    Padding="0" MinHeight="20" Margin="1,1,23,1" ToolTip="Clear the call filter"
+                                    AutomationProperties.Name="Clear call filter">
+                                <Button.Style>
+                                    <Style TargetType="Button" BasedOn="{StaticResource FlatButton}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Text, ElementName=ApiSearch}" Value="">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+                        </Grid>
+                        <StackPanel Grid.Column="3" x:Name="DisplayFilters" Orientation="Horizontal">
+                            <ComboBox x:Name="CategoryCombo" DisplayMemberPath="Label" Width="150"
+                                      SelectionChanged="FilterChanged"
+                                      AutomationProperties.Name="Category display filter"
+                                      ToolTip="{Binding SelectedItem.Label, RelativeSource={RelativeSource Self}}" />
+                            <CheckBox x:Name="FailuresCheck" Content="Fa_ilures" VerticalAlignment="Center"
+                                      Margin="8,0,0,0" Checked="DisplayFilterChanged"
+                                      Unchecked="DisplayFilterChanged" />
+                            <CheckBox x:Name="FromAppCheck" Content="F_rom app" VerticalAlignment="Center"
+                                      Margin="8,0,0,0" Checked="FromAppChanged" Unchecked="FromAppChanged"
+                                      ToolTipService.ShowOnDisabled="True" />
+                        </StackPanel>
+                    </Grid>
+                    <Border Grid.Row="2" x:Name="FindBar" Padding="6,0,6,6" Visibility="Collapsed">
+                        <DockPanel>
+                            <Button DockPanel.Dock="Right" Content="×" Click="CloseFind" Padding="7,0" Margin="5,0,0,0"
+                                    ToolTip="Close find (Esc)" AutomationProperties.Name="Close find" />
+                            <Button x:Name="HighlightButton" DockPanel.Dock="Right" Content="_Highlights…"
+                                    Click="ShowHighlights" Margin="5,0,0,0"
+                                    ToolTip="Keep coloring calls that match a filter." />
+                            <Button x:Name="FindNextButton" DockPanel.Dock="Right" Content="▼" Click="FindNext"
+                                    Padding="7,0" Margin="2,0,0,0" ToolTip="Next match (F3 or Enter)"
+                                    AutomationProperties.Name="Next match" />
+                            <Button x:Name="FindPreviousButton" DockPanel.Dock="Right" Content="▲"
+                                    Click="FindPrevious"
+                                    Padding="7,0" ToolTip="Previous match (Shift+F3 or Shift+Enter)"
+                                    AutomationProperties.Name="Previous match" />
+                            <TextBlock x:Name="FindStatus" DockPanel.Dock="Right" Style="{StaticResource Muted}"
+                                       FontSize="11" VerticalAlignment="Center" Margin="8,0" />
+                            <TextBlock DockPanel.Dock="Left" Text="Find" Style="{StaticResource Muted}"
+                                       VerticalAlignment="Center" Margin="2,0,8,0" />
+                            <TextBox x:Name="FindText" TextChanged="FindChanged" AutomationProperties.Name="Find calls"
+                                     ToolTip="Highlights matching calls without hiding the others. Accepts the same terms as the filter." />
+                        </DockPanel>
+                    </Border>
+                    <Border Grid.Row="3" x:Name="TimelinePanel" Background="#1C1D20" Height="30" Padding="6,2"
+                            BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Visibility="Collapsed">
+                        <local:CallTimeline x:Name="Timeline" SizeChanged="TimelineResized"
+                                            AutomationProperties.Name="Call timeline" />
+                    </Border>
+                    <Grid Grid.Row="4">
+                        <DataGrid x:Name="CallsGrid" SelectionChanged="CallSelected" SizeChanged="CallListResized"
+                                  CanUserSortColumns="False" ContextMenuOpening="CallContextOpening"
+                                  PreviewMouseRightButtonDown="GridRightClicked" PreviewMouseWheel="CallsScrolled"
+                                  FontFamily="Consolas" FontSize="12" ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                  AutomationProperties.Name="Captured calls">
+                            <DataGrid.ContextMenu><ContextMenu /></DataGrid.ContextMenu>
+                            <DataGrid.RowStyle>
+                                <Style TargetType="DataGridRow" BasedOn="{StaticResource {x:Type DataGridRow}}">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="1"><Setter
+                                            Property="Background" Value="#5C4B12" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="2"><Setter
+                                            Property="Background" Value="#1F4A3A" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="3"><Setter
+                                            Property="Background" Value="#4A2A4F" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="4"><Setter
+                                            Property="Background" Value="#1F3F5C" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="5"><Setter
+                                            Property="Background" Value="#5A3320" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="6"><Setter
+                                            Property="Background" Value="#3F4A1F" /></DataTrigger>
+                                        <DataTrigger Binding="{Binding MarkSlot}" Value="7"><Setter
+                                            Property="Background" Value="#4F2630" /></DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </DataGrid.RowStyle>
+                            <DataGrid.Resources>
+                                <Style x:Key="ReturnText" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
+                                    <Setter Property="ToolTip" Value="{Binding ReturnSummary}" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsFailure}" Value="True">
+                                            <Setter Property="Foreground" Value="{StaticResource DangerBrush}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </DataGrid.Resources>
+                            <DataGrid.Columns>
+                                <DataGridTextColumn x:Name="TimeColumn" Header="Time" Binding="{Binding Time}"
+                                                    Width="102" MinWidth="102"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn x:Name="ElapsedColumn" Header="Elapsed (s)"
+                                    Binding="{Binding Elapsed}"
+                                                    Width="100" MinWidth="80" Visibility="Collapsed"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="PID / TID" Binding="{Binding Identity}"
+                                                    Width="125" MinWidth="125"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn x:Name="FunctionColumn" Header="Function"
+                                                    Binding="{Binding FunctionText}" Width="1.2*" MinWidth="205"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn x:Name="ArgumentsColumn" Header="Arguments"
+                                    Binding="{Binding Summary}"
+                                                    Width="1.5*" MinWidth="180"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="Result" Binding="{Binding ResultDisplay}"
+                                                    Width="230" MinWidth="140"
+                                                    ElementStyle="{StaticResource ReturnText}" />
+                                <DataGridTextColumn x:Name="StateColumn" Header="Status"
+                                    Binding="{Binding CaptureState}"
+                                                    Width="100" MinWidth="65"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="Adjusted (µs)" Binding="{Binding AdjustedDuration}"
+                                                    Width="108"
+                                                    MinWidth="100" Visibility="Collapsed"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Elapsed (µs)" Binding="{Binding Duration}" Width="108"
+                                                    MinWidth="100" Visibility="Collapsed"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Δ µs" Binding="{Binding Delta}"
+                                                    Width="75" MinWidth="65" Visibility="Collapsed"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Category" Binding="{Binding Category}"
+                                                    Width="150" MinWidth="120" Visibility="Collapsed"
+                                                    ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="110"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="PID" Binding="{Binding PidText}" Width="65"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="TID" Binding="{Binding TidText}" Width="65"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Call ID" Binding="{Binding IdText}" Width="80"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Depth" Binding="{Binding DepthText}" Width="60"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Caller" Binding="{Binding Caller}" Width="250"
+                                                    Visibility="Collapsed" ElementStyle="{StaticResource CellText}" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                        <DataGrid x:Name="SummaryGrid" Visibility="Collapsed" CanUserSortColumns="True"
+                                  Sorting="SummarySorting" MouseDoubleClick="SummaryActivated"
+                                  PreviewKeyDown="SummaryKeyDown" ContextMenuOpening="SummaryContextOpening"
+                                  FontFamily="Consolas" FontSize="12" AutomationProperties.Name="Calls by API"
+                                  ToolTip="Durations include capture overhead.">
+                            <DataGrid.ContextMenu><ContextMenu /></DataGrid.ContextMenu>
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Function" Binding="{Binding Function}" Width="1.5*"
+                                                    MinWidth="200" ElementStyle="{StaticResource CellText}" />
+                                <DataGridTextColumn Header="Calls" Binding="{Binding CallsText}" SortMemberPath="Calls"
+                                                    Width="95" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="% of calls" Binding="{Binding ShareText}"
+                                                    SortMemberPath="Share" Width="90"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Failed" Binding="{Binding FailedText}"
+                                    SortMemberPath="Failed"
+                                                    Width="80" ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Total (ms)" Binding="{Binding TotalText}"
+                                                    SortMemberPath="TotalMs" Width="110"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Average (µs)" Binding="{Binding AverageText}"
+                                                    SortMemberPath="AverageUs" Width="115"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Longest (µs)" Binding="{Binding LongestText}"
+                                                    SortMemberPath="LongestUs" Width="115"
+                                                    ElementStyle="{StaticResource CellNumber}" />
+                                <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="150"
+                                                    ElementStyle="{StaticResource CellText}" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                        <StackPanel x:Name="EmptyState" VerticalAlignment="Center" HorizontalAlignment="Center"
+                            Margin="20">
+                            <TextBlock x:Name="EmptyTitle" Text="No trace loaded" FontWeight="SemiBold"
+                                HorizontalAlignment="Center" />
+                            <TextBlock x:Name="EmptyMessage" Text="Launch, attach, or open a capture database."
+                                       Style="{StaticResource Muted}" Margin="0,5,0,0"
+                                       TextWrapping="Wrap" TextAlignment="Center" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </Border>
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                          ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                          Cursor="SizeWE" AutomationProperties.Name="Resize call inspector" />
+            <Border Grid.Column="2" Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Margin="8,6">
+                        <TextBlock x:Name="DetailTitle" Text="Call inspector" FontFamily="Consolas" FontSize="13"
+                                   FontWeight="SemiBold" TextTrimming="CharacterEllipsis"
+                                   ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                        <TextBlock x:Name="DetailSubtitle" Text="No call selected" Style="{StaticResource Muted}"
+                                   FontSize="11" Margin="0,3,0,0" TextWrapping="Wrap" />
+                        <TextBlock x:Name="DetailContext" Style="{StaticResource Muted}" FontFamily="Consolas"
+                                   FontSize="11" Margin="0,3,0,0" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Border Grid.Row="1" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"
+                        Padding="8,5">
+                        <StackPanel>
+                            <TextBlock x:Name="DetailSummary" Text="Select a trace row to inspect its parameters."
+                                       FontSize="11" TextWrapping="Wrap" />
+                            <TextBlock x:Name="DetailSignature" FontFamily="Consolas" FontSize="11" Margin="0,4,0,0"
+                                       TextTrimming="CharacterEllipsis"
+                                       ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                        </StackPanel>
+                    </Border>
+                    <TabControl Grid.Row="2">
+                        <TabItem Header="Para_meters"><local:ParameterGrid x:Name="Parameters"
+                            IncludeStack="False" /></TabItem>
+                        <TabItem x:Name="StackTab" Header="Call stac_k">
+                            <DockPanel>
+                                <TextBlock x:Name="StackStatus" DockPanel.Dock="Top" Text="No stack recorded."
+                                           Style="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap"
+                                           Margin="8,6" />
+                                <DataGrid x:Name="StackGrid" FontFamily="Consolas" FontSize="12"
+                                          MouseDoubleClick="StackActivated" PreviewKeyDown="StackKeyDown"
+                                          PreviewMouseRightButtonDown="GridRightClicked"
+                                          ContextMenuOpening="StackContextOpening"
+                                          AutomationProperties.Name="Call stack">
+                                    <DataGrid.ContextMenu><ContextMenu /></DataGrid.ContextMenu>
+                                    <DataGrid.RowStyle>
+                                        <Style TargetType="DataGridRow"
+                                               BasedOn="{StaticResource {x:Type DataGridRow}}">
+                                            <Setter Property="ToolTip" Value="{Binding Path}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Application}" Value="True">
+                                                    <Setter Property="Foreground"
+                                                            Value="{StaticResource AccentBrush}" />
+                                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </DataGrid.RowStyle>
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="35"
+                                                            ElementStyle="{StaticResource CellNumber}" />
+                                        <DataGridTextColumn Header="Frame" Binding="{Binding Display}" Width="*"
+                                                            MinWidth="160"
+                                                            ElementStyle="{StaticResource CellText}" />
+                                        <DataGridTextColumn Header="Source" Binding="{Binding Location}" Width="160"
+                                                            ElementStyle="{StaticResource CellText}" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </DockPanel>
+                        </TabItem>
+                        <TabItem Header="Raw _details">
+                            <TextBox x:Name="DetailText" IsReadOnly="True" AcceptsReturn="True" FontFamily="Consolas"
+                                     FontSize="12" BorderThickness="0" Background="Transparent" TextWrapping="NoWrap"
+                                     Padding="8" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                     AutomationProperties.Name="Raw call details" />
+                        </TabItem>
+                    </TabControl>
+                    <Border Grid.Row="3" x:Name="BreakActions" BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="0,1,0,0" Padding="6,4" Visibility="Collapsed">
+                        <WrapPanel>
+                            <Button x:Name="EntryButton" Content="Break on entry" Click="BreakOnEntry" Margin="0,0,4,0"
+                                />
+                            <Button x:Name="ReturnButton" Content="Break on return" Click="BreakOnReturn"
+                                Margin="0,0,4,0" />
+                            <Button x:Name="ClearBreaksButton" Content="Clear breakpoints" Click="ClearBreakpoints" />
+                        </WrapPanel>
+                    </Border>
+                </Grid>
+            </Border>
+        </Grid>
+        <Border Grid.Row="4" Background="{StaticResource RaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0" Padding="9,5" Margin="0,6,0,0">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" TextElement.FontSize="11">
+                    <TextBlock Text="Calls " Style="{StaticResource Muted}" /><TextBlock x:Name="CallsText" Text="0"
+                        Margin="0,0,14,0" />
+                    <TextBlock Text="Processes " Style="{StaticResource Muted}" /><TextBlock x:Name="ProcessesText"
+                        Text="0" Margin="0,0,14,0" />
+                    <TextBlock Text="Queued " Style="{StaticResource Muted}" /><TextBlock x:Name="QueueText" Text="0"
+                        Margin="0,0,14,0" />
+                    <TextBlock Text="Wait " Style="{StaticResource Muted}" /><TextBlock x:Name="WaitText" Text="0 ms"
+                               ToolTip="Cumulative time target threads waited for capture storage." />
+                </StackPanel>
+                <TextBlock x:Name="StatusText" Text="Starting capture service…" Style="{StaticResource Muted}"
+                           FontSize="11" TextTrimming="CharacterEllipsis" Margin="0,0,15,0" />
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>

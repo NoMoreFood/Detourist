@@ -1,0 +1,8 @@
+LIBRARY wininet.dll
+EXPORTS
+    OrdinalDavCompliance @104 NONAME
+    OrdinalProfilesEnabled @112 NONAME
+    OrdinalMapPolicy @120 NONAME
+    OrdinalGetPolicy @121 NONAME
+    OrdinalFreePolicy @122 NONAME
+    OrdinalPolicyStatus @123 NONAME
