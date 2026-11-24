@@ -1,54 +1,40 @@
 # Detourist
 
-Detourist is a Windows desktop API tracing tool for x64 and x86 programs. It records calls, arguments, return values, timing, and optional call stacks in SQLite trace files. The desktop app provides filtering, summaries, a timeline, parameter inspection, an API catalog editor, and Window Spy.
+Detourist shows which Windows API calls an application makes, what each call returns, and how long it takes. Use a trace to see which file an application tried to open, find a slow call, or identify the code that made a call.
 
-## Build and run
+## Install Detourist
 
-Install the Visual Studio C++ desktop toolchain and Windows SDK selected in `CMakePresets.json`, the .NET SDK selected in `global.json`, Python, and WiX matching the major version checked by `Build/Build.ps1`. The native profiler also requires the .NET Framework SDK headers and libraries. CMake uses pinned dependency downloads, so a first build needs network access.
+Detourist runs on 64-bit Windows and can trace both 32-bit (x86) and 64-bit (x64) applications. Choose a package from the [latest release](https://github.com/NoMoreFood/Detourist/releases/latest).
 
-From the repository root, build both architectures, run the tests, and assemble the desktop app:
+- **MSI installer** — Run the `.msi` and open **Detourist** from the Start menu.
+- **Portable ZIP** — Extract the entire ZIP to a folder and run `Detourist.exe` there. Keep the `x86` subfolder and the other extracted files together.
 
-```powershell
-.\Build\Build.cmd -Test
-```
+To compile Detourist yourself, see the [source build guide](Build/README.md).
 
-Run `Build\PackageStage\Detourist.exe`. Keep the entire staged directory together, including its `x86` subdirectory, API catalogs, and instruction runtime files. The build also produces a portable ZIP and an MSI under `Build\Output`.
+## Record a trace
 
-The build accepts `-Configuration`, `-BuildJobs`, and `-Version`. Omit `-Test` to skip executing tests. `Build/PackageStage` is rebuilt during packaging; build and test failures before staging preserve the existing package. Signing is optional: use `-Sign` with `-CertificateThumbprint` and `-TimestampUrl`, or their `DETOURIST_SIGNING_CERTIFICATE_THUMBPRINT` and `DETOURIST_TIMESTAMP_URL` environment variables.
+For a file or network problem, you can narrow the recording before you start. Choose **File / registry / network I/O** from **Capture mode**.
 
-For native development without packaging, use the configured Visual Studio installation's CMake and CTest tools:
+1. Choose **Launch** to record an application from startup. Select its `.exe` and enter any command-line arguments it needs. For an application that is already running, choose **Attach** and select the process by name or ID.
+2. Perform the action you want to examine in the application, such as opening a document. The calls appear in Detourist as the application runs.
+3. Select **Stop** when the action finishes. The trace stays open for inspection.
 
-```powershell
-cmake --preset windows-x64
-cmake --build --preset x64-release
-ctest --preset x64-release
+Detourist saves each recording automatically as a SQLite `.db` file in `%LOCALAPPDATA%\Detourist\Traces`, named after the application and start time. Use **Open trace** (`Ctrl+O`) or drag a saved trace into the window to reopen it. To save future traces elsewhere, change **Trace folder** under **Settings** → **General**.
 
-cmake --preset windows-x86
-cmake --build --preset x86-release
-ctest --preset x86-release
-```
+## Inspect a trace
 
-The native executables are written to `Build\Temp\x64\bin\Release` and `Build\Temp\x86\bin\Release`. Building the WPF project alone does not stage the collector and its runtime dependencies; use the packaging workflow to run the complete desktop app. Tests exercise local fixture programs, and some require an interactive Windows desktop or optional platform components.
+- **Investigate a failure.** Select **Failures**, then select a call. For a failed file operation, check the path in **Parameters** and the return value in the **Result** column. The **Call stack** tab shows the callers when stacks were recorded.
+- **Find a delay.** Choose **Slowest first** to see which individual calls took the longest. Select **Summary** to compare call counts, failures, and time by API. Double-click a summary row to see its calls.
+- **Navigate a busy trace.** Filter by process, thread, or category. Click the timeline to jump to calls near a particular time, or use **Find** (`Ctrl+F`) and `F3` to step through matches.
 
-## Work with traces
+If an expected call is missing, clear any display filters with **Reset filters**. Open **Coverage** to check what Detourist could monitor for that process. To choose which categories or sources to record next time, use **Settings** → **Capture filters**.
 
-1. Open **Settings** to choose capture sources, categories, buffer limits, and optional stacks.
-2. Use **Launch** for a new program or **Attach** for a running program. The app selects the matching collector architecture.
-3. Select a call to inspect its inputs, outputs, and available stack information. Use display filters, **Find**, **Summary**, and the timeline to navigate recorded calls.
-4. Use **Stop** to end recording and release the target. Open the saved database later with **Open trace** or by dropping it into the window.
+## Look up a window or an API
 
-Traces default to `%LOCALAPPDATA%\Detourist\Traces`; change the trace folder in Settings. Desktop preferences are stored in `%LOCALAPPDATA%\Detourist\Desktop.json`. Capture settings control what gets recorded; display filters only change which recorded calls are shown. Coverage depends on the selected engine, target architecture, available providers, and catalog metadata; inspect **Coverage** for the session's reported status.
+If you know the window but need its process, open **Window Spy** and drag **Find window** onto it. You can inspect the owning process and thread or log the window’s messages.
 
-## Catalog maintenance
+Open **Catalog** to look up API signatures, parameter types, and the rules used to recognize failed calls. Saved edits apply to the next capture that uses that catalog.
 
-The desktop **Catalog** window opens the catalog beside the application. Saved edits apply to the next capture session without rebuilding. Use **Open catalog** to edit another copy; x86 captures use the catalog in the application's `x86` subdirectory. The **Architecture** selector changes which architecture's metadata you edit within the open file.
+## License
 
-To maintain the repository catalog, open `Source\catalog\ApiCatalog.sqlite` in the editor, then rebuild and stage the application to deploy those changes. Packaging replaces the staged catalogs with copies of the repository catalog.
-
-## Source layout
-
-- `Source`: desktop interface, collectors, capture engines, shared code, and API catalogs.
-- `Build`: build entry points, installer inputs, and catalog generation scripts. Intermediate files are under `Build/Temp`; distributions are under `Build/Output`.
-- `Test`: native and managed fixtures, desktop regressions, catalog checks, and integration tests.
-
-The project license is in `LICENSE`; packaged third-party notices are in `licenses`.
+Third-party notices are included in the `licenses` folder. Detourist is distributed under the [GNU General Public License v3.0 only](LICENSE).
