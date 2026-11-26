@@ -13,6 +13,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Detourist
@@ -21,6 +22,7 @@ struct CatalogCache
 {
     Handle mapping;
     std::unique_ptr<void, decltype(&UnmapViewOfFile)> view{nullptr, UnmapViewOfFile};
+    std::vector<std::byte> metadata;
     std::wstring name, path;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> watcher{nullptr, sqlite3_close};
     int version = 0;
@@ -148,13 +150,14 @@ bool InvalidCaptureRule(const ExportParameter& value, uint32_t pointerSize, uint
     }
 }
 
-void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
+void PrepareApiCatalog(CatalogUse use, uint32_t pointerSize)
 {
     if (pointerSize != 4 && pointerSize != 8)
         throw std::runtime_error("Invalid target pointer width.");
     std::lock_guard lock(CatalogGate);
     auto& catalog = CaptureCatalogs[pointerSize == 4 ? 0 : 1];
-    if (catalog.mapping && !refresh) return;
+    if ((catalog.mapping && use != CatalogUse::Refresh) || (use == CatalogUse::Metadata && !catalog.metadata.empty()))
+        return;
     wchar_t overridePath[32768];
     auto characters = pointerSize == 4 ?
         GetEnvironmentVariableW(L"DETOURIST_API_CATALOG_X86", overridePath, std::size(overridePath)) : 0;
@@ -183,8 +186,11 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
         sqlite3_busy_timeout(database, CatalogBusyTimeoutMs);
         return owner;
     };
-    snapshot.watcher = openCatalog();
-    snapshot.version = ApiCatalogDataVersion(snapshot.watcher.get());
+    if (use != CatalogUse::Metadata)
+    {
+        snapshot.watcher = openCatalog();
+        snapshot.version = ApiCatalogDataVersion(snapshot.watcher.get());
+    }
     auto owner = openCatalog();
     auto database = owner.get();
     sqlite3_progress_handler(database, SqliteProgressInterval, QueryWork::Interrupt, nullptr);
@@ -197,28 +203,33 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
         if (QueryWork::Interrupt(nullptr)) throw std::runtime_error("Query interrupted.");
         return statement.Next();
     };
-    Statement counts(database, "SELECT (SELECT count(*) FROM builtin_apis), (SELECT count(*) FROM plans WHERE kind=0),"
-        " (SELECT count(*) FROM plans), (SELECT count(*) FROM interfaces),"
-        " (SELECT count(*) FROM interface_methods), (SELECT count(*) FROM ordinal_exports),"
-        " (SELECT user_version FROM pragma_user_version), (SELECT count(*) FROM module_aliases)");
-    Statement categoryCounts(database,
-        "SELECT (SELECT count(*) FROM categories), (SELECT count(*) FROM category_rules)");
-    if (!step(counts) || sqlite3_column_int(counts.value, 6) != ApiCatalogSchemaVersion || !step(categoryCounts))
+    Statement counts(database, "SELECT user_version,(SELECT count(*) FROM builtin_apis),"
+        "(SELECT count(*) FROM categories),(SELECT count(*) FROM category_rules),(SELECT count(*) FROM module_aliases)"
+        " FROM pragma_user_version");
+    if (!step(counts) || sqlite3_column_int(counts.value, 0) != ApiCatalogSchemaVersion)
         throw std::runtime_error("Unsupported API catalog schema.");
     CatalogHeader header{CatalogMagic, CatalogVersion};
     Statement architecture(database, "SELECT json_extract(layout,'$.size') FROM types WHERE name='SIZE_T'");
     if (!step(architecture) || sqlite3_column_int(architecture.value, 0) != static_cast<int>(pointerSize))
         throw std::runtime_error("The API catalog does not match this collector's pointer width.");
     header.pointerSize = pointerSize;
-    header.builtinCount = sqlite3_column_int(counts.value, 0);
-    header.exportCount = sqlite3_column_int(counts.value, 1);
-    header.planCount = sqlite3_column_int(counts.value, 2);
-    header.interfaceCount = sqlite3_column_int(counts.value, 3);
-    header.slotCount = sqlite3_column_int(counts.value, 4);
-    header.ordinalCount = sqlite3_column_int(counts.value, 5);
-    header.moduleAliasCount = sqlite3_column_int(counts.value, 7);
-    header.categoryCount = sqlite3_column_int(categoryCounts.value, 0);
-    header.categoryRuleCount = sqlite3_column_int(categoryCounts.value, 1);
+    header.builtinCount = sqlite3_column_int(counts.value, 1);
+    header.categoryCount = sqlite3_column_int(counts.value, 2);
+    header.categoryRuleCount = sqlite3_column_int(counts.value, 3);
+    header.moduleAliasCount = sqlite3_column_int(counts.value, 4);
+    if (use != CatalogUse::Metadata)
+    {
+        // Only recording needs capture plans, interface slots and ordinal exports.
+        Statement capture(database, "SELECT (SELECT count(*) FROM plans WHERE kind=0),(SELECT count(*) FROM plans),"
+            "(SELECT count(*) FROM interfaces),(SELECT count(*) FROM interface_methods),"
+            "(SELECT count(*) FROM ordinal_exports)");
+        if (!step(capture)) throw std::runtime_error("Missing API capture plans.");
+        header.exportCount = sqlite3_column_int(capture.value, 0);
+        header.planCount = sqlite3_column_int(capture.value, 1);
+        header.interfaceCount = sqlite3_column_int(capture.value, 2);
+        header.slotCount = sqlite3_column_int(capture.value, 3);
+        header.ordinalCount = sqlite3_column_int(capture.value, 4);
+    }
     constexpr uint32_t MaxCatalogPlans = 262144;
     constexpr uint32_t MaxCatalogSlots = 1048576;
     constexpr uint32_t MaxCatalogOrdinals = 65536;
@@ -360,6 +371,20 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
         memcpy(image.data() + header.builtinOffset + index++ * sizeof(value), &value, sizeof(value));
     }
 
+    // Browsing uses the built-in signatures and category policy without allocating a capture mapping.
+    if (use == CatalogUse::Metadata)
+    {
+        header.bytes = static_cast<uint32_t>(image.size());
+        memcpy(image.data(), &header, sizeof(header));
+        CatalogView view;
+        if (index != header.builtinCount || !view.Open(image.data(), image.size(), pointerSize) ||
+            (pointerSize == sizeof(void*) && !BindApiMetadata(view)))
+            throw std::runtime_error("Invalid API catalog metadata or category policy.");
+        snapshot.metadata = std::move(image);
+        catalog = std::move(snapshot);
+        return;
+    }
+
     // Keep ordinal labels in the shared snapshot so observers never query SQLite during tracing.
     Statement ordinals(database, "SELECT lower(module),ordinal,name FROM ordinal_exports"
         " ORDER BY lower(module),ordinal");
@@ -431,9 +456,13 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
     // Plans are ordered by kind, name and identity; a COM plan is named by its method alone.
     std::unordered_map<sqlite3_int64, uint32_t> planIndices;
     planIndices.reserve(header.planCount);
-    std::vector<CatalogPlan> planValues;
-    std::vector<std::tuple<int, std::string, sqlite3_int64, uint32_t>> planOrder;
-    planValues.reserve(header.planCount);
+    struct PlanOrder
+    {
+        int kind;
+        uint32_t name, nameBytes, source;
+        sqlite3_int64 identity;
+    };
+    std::vector<PlanOrder> planOrder;
     planOrder.reserve(header.planCount);
     std::unordered_map<std::string, std::pair<uint32_t, uint32_t>, CatalogTextHash, std::equal_to<>> parameterLists;
     struct ParameterExtent { uint32_t ordinal, product, prefix, offset; };
@@ -483,13 +512,14 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
     index = 0;
     while (step(plans))
     {
+        if (index >= header.planCount) throw std::runtime_error("Invalid API capture plan count.");
         CatalogPlan value{};
         auto identity = sqlite3_column_int64(plans.value, 0);
         auto kind = sqlite3_column_int(plans.value, 18);
         auto qualified = sqlite3_column_text(plans.value, 1);
         if (!qualified) throw std::runtime_error("API catalog contains missing metadata.");
-        std::string name(reinterpret_cast<const char*>(qualified), sqlite3_column_bytes(plans.value, 1));
-        if (auto scope = name.rfind("::"); kind && scope != std::string::npos) name.erase(0, scope + 2);
+        std::string_view name(reinterpret_cast<const char*>(qualified), sqlite3_column_bytes(plans.value, 1));
+        if (auto scope = name.rfind("::"); kind && scope != std::string_view::npos) name.remove_prefix(scope + 2);
         value.name = intern(name);
         value.module = text(plans.value, 2);
 
@@ -752,16 +782,32 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
             }
             value.parameters = found->second.first;
         }
-        planOrder.emplace_back(kind, std::move(name), identity, index++);
-        planValues.push_back(value);
+        memcpy(image.data() + header.planOffset + index * sizeof(value), &value, sizeof(value));
+        planOrder.push_back({kind, value.name, static_cast<uint32_t>(name.size()), index++, identity});
     }
     if (index != header.planCount) throw std::runtime_error("Incomplete API capture plans.");
-    std::sort(planOrder.begin(), planOrder.end());
+    std::ranges::sort(planOrder, {}, [&](const PlanOrder& plan)
+    {
+        return std::tuple{plan.kind, std::string_view(reinterpret_cast<const char*>(image.data() + plan.name),
+            plan.nameBytes), plan.identity, plan.source};
+    });
+
+    // Permute the plan table in place. Each cycle needs a single saved plan, even for a large catalog.
+    auto table = reinterpret_cast<CatalogPlan*>(image.data() + header.planOffset);
     for (uint32_t position = 0; position < planOrder.size(); ++position)
     {
-        planIndices.emplace(std::get<2>(planOrder[position]), position);
-        memcpy(image.data() + header.planOffset + position * sizeof(CatalogPlan),
-            &planValues[std::get<3>(planOrder[position])], sizeof(CatalogPlan));
+        planIndices.emplace(planOrder[position].identity, position);
+        if (planOrder[position].source == position) continue;
+        auto saved = table[position];
+        auto hole = position;
+        while (planOrder[hole].source != position)
+        {
+            auto source = std::exchange(planOrder[hole].source, hole);
+            table[hole] = table[source];
+            hole = source;
+        }
+        table[hole] = saved;
+        planOrder[hole].source = hole;
     }
 
     // Resolve built-in plans once; hooks only index the immutable snapshot while capturing calls.
@@ -774,7 +820,7 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
         if (found != planIndices.end()) value.planIndex = found->second;
         if ((IsWin32Api(static_cast<Api>(position)) || IsNativeApi(static_cast<Api>(position)) ||
             IsWin32uApi(static_cast<Api>(position))) && (found == planIndices.end() ||
-            pointerSize == 8 && !planValues[std::get<3>(planOrder[found->second])].signature.supported))
+            pointerSize == 8 && !table[found->second].signature.supported))
             throw std::runtime_error("Missing built-in API capture plan.");
         memcpy(image.data() + offset, &value, sizeof(value));
     }
@@ -942,7 +988,7 @@ void PrepareApiCatalog(bool refresh, uint32_t pointerSize)
 
 const std::wstring& CaptureCatalogName(uint32_t pointerSize)
 {
-    PrepareApiCatalog(false, pointerSize);
+    PrepareApiCatalog(CatalogUse::Capture, pointerSize);
     return CaptureCatalogs[pointerSize == 4 ? 0 : 1].name;
 }
 }

@@ -5,17 +5,17 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <string_view>
 
 namespace Detourist
 {
 // Lowercases ASCII so API and text patterns compare without locale rules.
-std::string Lower(std::string_view text)
+std::string Lower(std::string text)
 {
-    std::string result(text);
-    for (auto& character : result)
+    for (auto& character : text)
         if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + 32);
-    return result;
+    return text;
 }
 
 // Substring match unless the pattern is exact or uses '*' to span any run of characters.
@@ -546,19 +546,32 @@ void TraceView::LoadApis()
         }
         return true;
     };
-    for (auto filter : filters) filter->apis.clear();
-    Statement apis(database_, "SELECT target,id,module,name,category FROM apis");
-    while (apis.Next())
-    {
-        auto key = (static_cast<uint64_t>(sqlite3_column_int64(apis.value, 0)) << 32) |
-            static_cast<uint32_t>(sqlite3_column_int64(apis.value, 1));
-        auto module = Lower(ColumnUtf8(apis.value, 2));
-        auto name = Lower(ColumnUtf8(apis.value, 3));
-        auto category = sqlite3_column_int(apis.value, 4);
-        for (auto filter : filters) filter->apis[key] = matches(*filter, module, name, category);
-    }
     for (auto filter : filters)
+    {
+        filter->apis.clear();
         filter->unknownApi = matches(*filter, {}, "unknown api", static_cast<int>(ApiCategory::Unclassified));
+    }
+    // A target inherits the shared definition for its API, or the unknown-API match when no definition exists.
+    for (auto scope : {"target=0", "target<>0"})
+    {
+        auto sql = "SELECT target,id,module,name,category FROM apis WHERE " + std::string(scope);
+        Statement apis(database_, sql.c_str());
+        while (apis.Next())
+        {
+            auto target = static_cast<uint64_t>(sqlite3_column_int64(apis.value, 0));
+            auto api = static_cast<uint32_t>(sqlite3_column_int64(apis.value, 1));
+            auto module = Lower(ColumnUtf8(apis.value, 2));
+            auto name = Lower(ColumnUtf8(apis.value, 3));
+            auto category = sqlite3_column_int(apis.value, 4);
+            for (auto filter : filters)
+            {
+                auto shared = target ? filter->apis.find(api) : filter->apis.end();
+                auto fallback = shared == filter->apis.end() ? filter->unknownApi : shared->second;
+                auto matched = matches(*filter, module, name, category);
+                if (matched != fallback) filter->apis.emplace((target << 32) | api, matched);
+            }
+        }
+    }
 }
 
 void TraceView::LoadModules()
@@ -645,11 +658,11 @@ std::string TraceView::ScanSql(const std::string& range) const
         range + where + " ORDER BY c.started" + direction + ",c.target" + direction + ",c.id" + direction;
 }
 
-void TraceView::Append(const Key& key, int64_t row)
+void TraceView::Append(sqlite3_stmt* call)
 {
     // Small views keep every call's identity; larger ones thin to evenly spaced checkpoints.
     if (checkpoints_.empty() || count_ - checkpoints_.back().index >= stride_)
-        checkpoints_.push_back({key, count_, row});
+        checkpoints_.push_back({ColumnKey(call), count_, sqlite3_column_int64(call, 4)});
     ++count_;
     if (stride_ == 1 && checkpoints_.size() > ExactLimit) Thin();
 }
@@ -706,6 +719,7 @@ bool TraceView::Scan(uint32_t budgetMilliseconds)
         range = order_ == ViewOrder::Oldest ? " AND (c.started,c.target,c.id)>(?2,?3,?4)" :
             " AND (c.started,c.target,c.id)<(?2,?3,?4)";
     Statement scan(database_, ScanSql(range).c_str());
+    const bool matchAll = SnapshotResidual().empty();
     scan.Bind(bound_);
     if (order_ == ViewOrder::Slowest) sqlite3_bind_int64(scan.value, 2, scanRow_);
     else if (hasScanKey_) BindKey(scan.value, 2, scanKey_);
@@ -713,28 +727,33 @@ bool TraceView::Scan(uint32_t budgetMilliseconds)
     {
         ++scanned_;
         if (order_ == ViewOrder::Slowest) scanRow_ = sqlite3_column_int64(scan.value, 0);
-        else
-        {
-            scanKey_ = ColumnKey(scan.value);
-            hasScanKey_ = true;
-        }
-        bool matched = sqlite3_column_int(scan.value, 3) != 0;
+        bool matched = matchAll || sqlite3_column_int(scan.value, 3) != 0;
         if (matched)
         {
-            if (order_ != ViewOrder::Slowest) Append(scanKey_, sqlite3_column_int64(scan.value, 4));
-            else if (slowest_.size() < SlowestLimit || sqlite3_column_int64(scan.value, 1) > slowest_.front().first)
+            if (order_ != ViewOrder::Slowest) Append(scan.value);
+            else if (slowest_.size() < SlowestLimit)
+            {
+                slowest_.emplace_back(sqlite3_column_int64(scan.value, 1), scanRow_);
+                if (slowest_.size() == SlowestLimit) std::make_heap(slowest_.begin(), slowest_.end(), Longer);
+            }
+            else if (sqlite3_column_int64(scan.value, 1) > slowest_.front().first)
             {
                 // A bounded heap retains the longest calls, earliest first among equals, without a full sort.
-                if (slowest_.size() == SlowestLimit)
-                {
-                    std::pop_heap(slowest_.begin(), slowest_.end(), Longer);
-                    slowest_.pop_back();
-                }
-                slowest_.emplace_back(sqlite3_column_int64(scan.value, 1), scanRow_);
+                std::pop_heap(slowest_.begin(), slowest_.end(), Longer);
+                slowest_.back() = {sqlite3_column_int64(scan.value, 1), scanRow_};
                 std::push_heap(slowest_.begin(), slowest_.end(), Longer);
             }
         }
-        if ((!matched || !(step & 15)) && std::chrono::steady_clock::now() >= deadline) return true;
+        if ((!matched || !(step & 15)) && std::chrono::steady_clock::now() >= deadline)
+        {
+            // Only the last visited key is needed to resume the next slice.
+            if (order_ != ViewOrder::Slowest)
+            {
+                scanKey_ = ColumnKey(scan.value);
+                hasScanKey_ = true;
+            }
+            return true;
+        }
     }
     if (order_ == ViewOrder::Slowest)
     {
@@ -756,8 +775,8 @@ void TraceView::Snapshot()
     pending_.clear();
     Statement pending(database_, ("SELECT c.rowid,c.started,c.target,c.id,c.ended,c.adjusted_duration,"
         "c.result,c.error,c.flags,(1=1" + filter_.where + ")," + markSql_ + " FROM calls c "
-        "INDEXED BY calls_pending WHERE (c.ended IS NULL OR (c.flags & " + std::to_string(AsyncPending) +
-        ")!=0) AND (c.flags & " + std::to_string(Continuation) + ")=0 AND c.rowid<=?1").c_str());
+        "WHERE (c.ended IS NULL OR (c.flags & " + std::to_string(AsyncPending) +
+        ")!=0) AND (c.flags & " + std::to_string(Continuation) + ")=0 AND +c.rowid<=?1").c_str());
     pending.Bind(bound_);
     while (pending.Next())
     {
@@ -909,9 +928,9 @@ bool TraceView::Extend(bool includeNew)
         while (fresh.Next())
         {
             if (!sqlite3_column_int(fresh.value, 3)) continue;
-            auto key = ColumnKey(fresh.value);
-            if (order_ == ViewOrder::Oldest) Append(key, sqlite3_column_int64(fresh.value, 4));
-            else if (added++ % stride_ == 0) leading.push_back({key, added - 1, sqlite3_column_int64(fresh.value, 4)});
+            if (order_ == ViewOrder::Oldest) Append(fresh.value);
+            else if (added++ % stride_ == 0)
+                leading.push_back({ColumnKey(fresh.value), added - 1, sqlite3_column_int64(fresh.value, 4)});
         }
         if (added)
         {
@@ -1093,77 +1112,83 @@ TraceView::Match TraceView::Seek(int64_t target, uint64_t callId, bool forward)
     return {static_cast<int64_t>(index), rows[0].target, rows[0].id};
 }
 
+static int64_t AddDuration(int64_t total, int64_t duration)
+{
+    if ((duration > 0 && total > INT64_MAX - duration) || (duration < 0 && total < INT64_MIN - duration))
+        throw std::runtime_error("Trace duration total exceeds the supported range.");
+    return total + duration;
+}
+
 bool TraceView::Summarize(uint32_t budgetMilliseconds, bool restart)
 {
     // Totals accumulate over bounded row ranges so a long pass shares the connection with other requests.
     ReadTransaction transaction(database_);
-    bool sparse = order_ != ViewOrder::Slowest && complete_ && stride_ == 1 &&
+    bool ranked = order_ == ViewOrder::Slowest;
+    bool sparse = !ranked && complete_ && stride_ == 1 &&
         count_ * 4 < static_cast<uint64_t>(bound_);
     if (restart || summaryRevision_ != revision_)
     {
         summaryRevision_ = revision_;
         totals_.clear();
         summaryRow_ = 0;
-        summaryBound_ = sparse ? static_cast<int64_t>(count_) :
-            order_ == ViewOrder::Slowest ? static_cast<int64_t>(slowest_.size()) : bound_;
+        summaryBound_ = ranked ? static_cast<int64_t>(slowest_.size()) :
+            sparse ? static_cast<int64_t>(count_) : bound_;
+        if (ranked)
+        {
+            // Visit the retained calls in database order while keeping their displayed ranks and frozen durations.
+            summaryOrder_.resize(slowest_.size());
+            std::iota(summaryOrder_.begin(), summaryOrder_.end(), 0u);
+            std::ranges::sort(summaryOrder_, {}, [this](uint32_t rank) { return slowest_[rank].second; });
+        }
         LoadApis();
     }
+    if (summaryRow_ >= summaryBound_) return true;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMilliseconds);
-    if (order_ == ViewOrder::Slowest || sparse)
-    {
-        // Sparse views and capped rankings summarize their known identities without scanning discarded calls.
-        Statement call(database_, ("SELECT c.target,c.api,snapshot_flags(c.rowid,c.flags)," +
-            std::string(sparse ? "snapshot_ended(c.rowid,c.ended)-c.started" : "NULL") +
-            " FROM calls c WHERE c.rowid=?").c_str());
-        while (summaryRow_ < summaryBound_)
-        {
-            auto position = static_cast<size_t>(summaryRow_);
-            auto row = sparse ? checkpoints_[position].row : slowest_[position].second;
-            call.Bind(row);
-            if (call.Next())
-            {
-                auto& totals = totals_[(static_cast<uint64_t>(sqlite3_column_int64(call.value, 0)) << 32) |
-                    static_cast<uint32_t>(sqlite3_column_int64(call.value, 1))];
-                ++totals.calls;
-                totals.failed += (sqlite3_column_int64(call.value, 2) & 1) != 0;
-                if (!sparse || sqlite3_column_type(call.value, 3) != SQLITE_NULL)
-                {
-                    auto duration = sparse ? sqlite3_column_int64(call.value, 3) : slowest_[position].first;
-                    ++totals.returned;
-                    totals.total += duration;
-                    totals.longest = std::max(totals.longest, duration);
-                }
-            }
-            SqlCheck(sqlite3_reset(call.value), database_);
-            ++summaryRow_;
-            if ((summaryRow_ & 255) == 0 && std::chrono::steady_clock::now() >= deadline) break;
-        }
-        return summaryRow_ >= summaryBound_;
-    }
-    std::string ended = pending_.empty() ? "c.ended" : "snapshot_ended(c.rowid,c.ended)";
-    std::string flags = pending_.empty() ? "c.flags" : "snapshot_flags(c.rowid,c.flags)";
-    Statement range(database_, ("SELECT c.target,c.api,count(*),sum((" + flags + " & 1)!=0),count(" + ended + "),"
-        "sum(" + ended + "-c.started),max(" + ended + "-c.started) FROM calls c NOT INDEXED "
-        "WHERE c.rowid>?1 AND c.rowid<=?2" + SnapshotWhere() + " GROUP BY c.target,c.api").c_str());
+    bool byId = sparse || ranked;
+    auto selection = byId ? "WHERE c.rowid=?1" :
+        "NOT INDEXED WHERE c.rowid>?1 AND c.rowid<=?2" + SnapshotWhere() + " ORDER BY c.rowid";
+    Statement calls(database_, ("SELECT c.target,c.api,c.flags,c.ended-c.started,c.rowid FROM calls c " +
+        selection).c_str());
+    auto pending = std::ranges::upper_bound(pending_, summaryRow_, {}, &PendingCall::row);
     while (summaryRow_ < summaryBound_)
     {
-        auto last = std::min(summaryBound_, summaryRow_ + 32768);
-        range.Bind(summaryRow_, last);
-        while (range.Next())
+        // Sparse views use their known identities. Dense views accumulate directly in row order without a sorter.
+        auto position = static_cast<size_t>(summaryRow_);
+        if (ranked) position = summaryOrder_[position];
+        auto last = summaryRow_ + std::min<int64_t>(byId ? 1 : 32768, summaryBound_ - summaryRow_);
+        if (byId) calls.Bind(sparse ? checkpoints_[position].row : slowest_[position].second);
+        else calls.Bind(summaryRow_, last);
+        while (calls.Next())
         {
-            auto& totals = totals_[(static_cast<uint64_t>(sqlite3_column_int64(range.value, 0)) << 32) |
-                static_cast<uint32_t>(sqlite3_column_int64(range.value, 1))];
-            totals.calls += sqlite3_column_int64(range.value, 2);
-            totals.failed += sqlite3_column_int64(range.value, 3);
-            totals.returned += sqlite3_column_int64(range.value, 4);
-            totals.total += sqlite3_column_int64(range.value, 5);
-            totals.longest = std::max(totals.longest, sqlite3_column_int64(range.value, 6));
+            auto row = sqlite3_column_int64(calls.value, 4);
+            const PendingCall* snapshot = nullptr;
+            if (byId) snapshot = FindPending(row);
+            else
+            {
+                while (pending != pending_.end() && pending->row < row) ++pending;
+                if (pending != pending_.end() && pending->row == row) snapshot = &*pending;
+            }
+            auto& totals = totals_[(static_cast<uint64_t>(sqlite3_column_int64(calls.value, 0)) << 32) |
+                static_cast<uint32_t>(sqlite3_column_int64(calls.value, 1))];
+            ++totals.calls;
+            auto flags = snapshot ? snapshot->flags : static_cast<uint32_t>(sqlite3_column_int(calls.value, 2));
+            totals.failed += (flags & Failed) != 0;
+            if (ranked || (snapshot ? snapshot->duration >= 0 : sqlite3_column_type(calls.value, 3) != SQLITE_NULL))
+            {
+                auto duration = ranked ? slowest_[position].first : snapshot ? snapshot->duration :
+                    sqlite3_column_int64(calls.value, 3);
+                ++totals.returned;
+                totals.total = AddDuration(totals.total, duration);
+                totals.longest = std::max(totals.longest, duration);
+            }
         }
-        SqlCheck(sqlite3_reset(range.value), database_);
+        SqlCheck(sqlite3_reset(calls.value), database_);
         summaryRow_ = last;
-        if (std::chrono::steady_clock::now() >= deadline) break;
+        if ((!byId || !(summaryRow_ & 255)) && std::chrono::steady_clock::now() >= deadline) break;
     }
-    return summaryRow_ >= summaryBound_;
+    if (summaryRow_ < summaryBound_) return false;
+    std::vector<uint32_t>().swap(summaryOrder_);
+    return true;
 }
 
 double TraceView::SummaryProgress() const
@@ -1194,7 +1219,7 @@ std::vector<ApiSummary> TraceView::Summary()
             entry.calls += totals.calls;
             entry.failed += totals.failed;
             entry.returned += totals.returned;
-            entry.total += totals.total;
+            entry.total = AddDuration(entry.total, totals.total);
             entry.longest = std::max(entry.longest, totals.longest);
         }
         SqlCheck(sqlite3_reset(identity.value), database_);
@@ -1239,7 +1264,7 @@ TraceView::Density TraceView::Timeline(uint32_t buckets, uint32_t budgetMillisec
     }
     if (!complete_) return density;
 
-    // Broad views favor the failure index; selective process or thread views keep their narrower access path.
+    // The failure predicate lets SQLite use the partial index or a narrower process or thread index.
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMilliseconds);
     sqlite3_progress_handler(database_, SqliteProgressInterval, [](void* context) -> int
     {
@@ -1248,8 +1273,7 @@ TraceView::Density TraceView::Timeline(uint32_t buckets, uint32_t budgetMillisec
     }, &deadline);
     {
         auto pending = pending_.empty() ? std::string{} : " AND snapshot_flags(c.rowid,NULL) IS NULL";
-        auto index = count_ >= static_cast<uint64_t>(bound_) / 4 ? " INDEXED BY calls_failed" : "";
-        Statement failed(database_, (std::string("SELECT c.started FROM calls c") + index +
+        Statement failed(database_, ("SELECT c.started FROM calls c"
             " WHERE (c.flags & " + std::to_string(Failed) + ") != 0 AND +c.rowid<=?1" +
             pending + SnapshotWhere() + " ORDER BY c.started").c_str());
         failed.Bind(bound_);

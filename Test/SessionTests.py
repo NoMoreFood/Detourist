@@ -453,8 +453,11 @@ def catalog_policy(arguments, root):
         connection.commit()
     environment = {**os.environ, "DETOURIST_API_CATALOG": str(catalog_path)}
     with Collector(arguments.collector, env=environment) as collector:
+        preview = collector.call("hello")
         started = time.perf_counter()
+        collector.call("validateCatalog")
         hello = collector.call("hello")
+        assert preview == hello
         print(f"Catalog policy and hello: {(time.perf_counter() - started) * 1000:.1f} ms", flush=True)
         labels = {item["id"]: item for item in hello["categories"]}
         assert labels[registry]["name"] == "Catalog registry"
@@ -519,6 +522,15 @@ def catalog_policy(arguments, root):
                 with closing(sqlite3.connect(catalog_path)) as connection:
                     connection.execute("UPDATE category_rules SET " + field + "=? WHERE position=0", (original,))
                     connection.commit()
+    # Browsing needs display metadata even when the recording plans fail validation.
+    with closing(sqlite3.connect(catalog_path)) as connection:
+        connection.execute("UPDATE catalog_capture_parameter_extents SET actual_offset=65536 "
+            "WHERE function_id=(SELECT min(function_id) FROM catalog_capture_parameter_extents WHERE architecture=0)")
+        connection.commit()
+    with Collector(arguments.collector, env=environment) as collector:
+        preview = collector.call("hello")
+        assert "capture extent" in collector.call("validateCatalog", expected=False)
+        assert collector.call("hello") == preview
     print("Catalog category rules, labels, rewrites, reloads and validation passed.", flush=True)
 
 
@@ -1053,6 +1065,18 @@ def check_nested_views(collector_path, target_path):
                 marked.update(collector.call('view', view=marked['view'], includeMetadata=False))
                 assert [(row['id'], row['marks']) for row in collector.rows(marked)] == [
                     (1, 1), (2, 1), (3, 0), (4, 0)]
+
+                # One target's API label can reverse both positive and negative shared-name matches.
+                connection.execute("INSERT INTO targets VALUES(2,124,'peer.exe',0,0,'Exited',8)")
+                connection.execute("INSERT INTO apis SELECT 2,id,module,'ScopedWrite',parameters,argument_count,"
+                    "category FROM apis WHERE target=0 AND id=?", (api['id'],))
+                connection.execute("INSERT INTO calls(target,id,tid,api,started,ended,arguments) "
+                    "VALUES(2,5,1,?,300,301,zeroblob(?))", (api['id'], api['argumentCount'] * 8))
+                connection.execute("UPDATE session SET total_calls=5")
+                connection.commit()
+                marked.update(collector.call('view', view=marked['view'], includeMetadata=False))
+                collector.call('mark', view=marked['view'], filters=['WriteFile', '-WriteFile', 'ScopedWrite'])
+                assert [(row['target'], row['marks']) for row in collector.rows(marked)] == [(1, 1)] * 4 + [(2, 6)]
     print('Nested views: live and saved boundaries, both orders, exclusions, children and marks passed.')
 
 

@@ -446,7 +446,7 @@ public static class CatalogValidator
             var width = catalog.Type("SIZE_T")?.Size;
             if (width is not (4 or 8)) return "The catalog has no valid pointer width.";
             await using var client = new CollectorClient(width.Value, path);
-            await client.Send("hello");
+            await client.Send("validateCatalog");
             return null;
         }
         catch (Exception error) when (error is IOException or JsonException or

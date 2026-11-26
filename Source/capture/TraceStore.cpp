@@ -2,7 +2,9 @@
 #include "RpcCapture.h"
 #include "ApiCatalog.h"
 #include <algorithm>
+#include <charconv>
 #include <cstring>
+#include <format>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -29,6 +31,120 @@ void SqlCheck(int status, sqlite3* database)
     if (status != SQLITE_OK && status != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
+struct SnapshotBuffer
+{
+    std::string_view header, data;
+    auto Key() const { return std::tuple{data.size(), data, header}; }
+};
+
+static bool NextBuffer(std::string_view& remaining, SnapshotBuffer& buffer)
+{
+    Value header;
+    if (remaining.size() < sizeof(header)) return false;
+    memcpy(&header, remaining.data(), sizeof(header));
+    if (header.capturedBytes > remaining.size() - sizeof(header)) return false;
+    buffer = {remaining.substr(0, sizeof(header)), remaining.substr(sizeof(header), header.capturedBytes)};
+    remaining.remove_prefix(sizeof(header) + header.capturedBytes);
+    return true;
+}
+
+template<class T> static void AppendNumber(std::string& text, T value)
+{
+    char digits[24];
+    text.append(digits, std::to_chars(digits, std::end(digits), value).ptr);
+}
+
+static void AppendRange(std::string& text, sqlite3_int64 start, size_t length)
+{
+    text += '[';
+    AppendNumber(text, start);
+    text += ',';
+    AppendNumber(text, length);
+    text += "],";
+}
+
+static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
+{
+    // Keep the original SQLite value for absent, malformed or incompressible snapshots.
+    sqlite3_result_value(context, values[1]);
+    const auto outputSize = sqlite3_value_bytes(values[1]);
+    const auto inputSize = sqlite3_value_bytes(values[0]);
+    if (!outputSize || !inputSize) return;
+    const auto* before = static_cast<const char*>(sqlite3_value_blob(values[0]));
+    const auto* after = static_cast<const char*>(sqlite3_value_blob(values[1]));
+    if (!before || !after) { sqlite3_result_error_nomem(context); return; }
+    const std::string_view input(before, inputSize), output(after, outputSize);
+    if (input == output)
+    {
+        sqlite3_result_zeroblob(context, 0);
+        return;
+    }
+
+    try
+    {
+        // Exact bytes identify reusable buffers. Sort headers last to prefer a match that also shares the metadata.
+        std::vector<SnapshotBuffer> buffers;
+        SnapshotBuffer buffer{};
+        for (auto remaining = input; !remaining.empty();)
+        {
+            if (!NextBuffer(remaining, buffer)) return;
+            buffers.push_back(buffer);
+        }
+        std::ranges::sort(buffers, {}, &SnapshotBuffer::Key);
+
+        // Positive offsets refer to entry bytes. Keep literal return ranges in their original order.
+        std::vector<std::pair<int, int>> ranges;
+        auto literal = after;
+        int literalBytes = 0;
+        auto appendLiteral = [&](const char* end)
+        {
+            if (literal == end) return;
+            auto length = static_cast<int>(end - literal);
+            ranges.emplace_back(-1 - static_cast<int>(literal - after), length);
+            literalBytes += length;
+        };
+        for (auto remaining = output; !remaining.empty();)
+        {
+            if (!NextBuffer(remaining, buffer)) return;
+            auto found = std::ranges::lower_bound(buffers, buffer.Key(), {}, &SnapshotBuffer::Key);
+            if (found == buffers.end() || found->data != buffer.data)
+            {
+                if (found == buffers.begin()) continue;
+                if ((--found)->data != buffer.data) continue;
+            }
+            const auto headerBytes = found->header == buffer.header ? sizeof(Value) : 0;
+            auto length = static_cast<int>(headerBytes + buffer.data.size());
+            if (!length) continue;
+            appendLiteral(buffer.data.data() - headerBytes);
+            auto offset = 1 + static_cast<int>(found->data.data() - headerBytes - before);
+            if (!ranges.empty() && ranges.back().first > 0 && ranges.back().first + ranges.back().second == offset)
+                ranges.back().second += length;
+            else ranges.emplace_back(offset, length);
+            literal = buffer.data.data() + buffer.data.size();
+        }
+        if (ranges.empty()) return;
+        appendLiteral(after + outputSize);
+
+        // A NUL terminates the JSON ranges. Negative SQLite offsets address literal bytes from the end of the blob.
+        std::string packed = "[";
+        int tail = -literalBytes;
+        for (auto [offset, length] : ranges)
+        {
+            AppendRange(packed, offset > 0 ? offset : tail, length);
+            if (offset < 0) tail += length;
+        }
+        packed.back() = ']';
+        packed += '\0';
+        if (packed.size() + literalBytes >= output.size()) return;
+        packed.reserve(packed.size() + literalBytes);
+        for (auto [offset, length] : ranges)
+            if (offset < 0) packed.append(after + (-1 - offset), length);
+        sqlite3_result_blob64(context, packed.data(), packed.size(), SQLITE_TRANSIENT);
+    }
+    catch (const std::bad_alloc&) { sqlite3_result_error_nomem(context); }
+    catch (const std::length_error&) { sqlite3_result_error_toobig(context); }
+}
+
 TraceStore::TraceStore(const std::wstring& path)
 {
     PrepareApiCatalog();
@@ -53,6 +169,9 @@ TraceStore::TraceStore(const std::wstring& path)
     try
     {
         sqlite3_busy_timeout(database_, TraceWriteBusyTimeoutMs);
+        SqlCheck(sqlite3_create_function_v2(database_, "pack_return", 2,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, nullptr, PackReturn, nullptr, nullptr, nullptr),
+            database_);
 
         // Grow the trace to each checkpoint's final extent before copying its pages on Windows.
         int pageBytes = 8192;
@@ -72,18 +191,19 @@ TraceStore::TraceStore(const std::wstring& path)
             " installed_win32 INTEGER DEFAULT 0, available_win32 INTEGER DEFAULT 0, installed_com INTEGER DEFAULT 0,"
             " managed_state INTEGER DEFAULT 0, managed_apis INTEGER DEFAULT 0, module_error INTEGER DEFAULT 0,"
             " instruction_state INTEGER DEFAULT 0, installed_exports INTEGER DEFAULT 0);"
-            "CREATE TABLE calls(target INTEGER NOT NULL, id INTEGER NOT NULL, tid INTEGER, api INTEGER,"
+            "CREATE TABLE call_records(target INTEGER NOT NULL, id INTEGER NOT NULL, tid INTEGER, api INTEGER,"
             " started INTEGER,"
             " ended INTEGER, parent INTEGER, depth INTEGER, caller INTEGER, arguments BLOB, result INTEGER,"
             " error INTEGER, flags INTEGER, input BLOB, output BLOB, module_epoch INTEGER NOT NULL DEFAULT 0,"
-            " adjusted_duration INTEGER,"
+            " adjusted_duration INTEGER, output_length INTEGER, input_parts TEXT,"
             " PRIMARY KEY(target,id));"
-            "CREATE INDEX calls_time ON calls(started,target,id,api);"
-            "CREATE INDEX calls_process ON calls(target,started,id,api);"
-            "CREATE INDEX calls_thread ON calls(target,tid,started,id,api);"
-            "CREATE INDEX calls_failed ON calls(started,target,id,api) WHERE (flags & " +
+            "CREATE TABLE input_blocks(id INTEGER PRIMARY KEY,data BLOB NOT NULL);"
+            "CREATE INDEX calls_time ON call_records(started,target,id,api);"
+            "CREATE INDEX calls_process ON call_records(target,started,id,api);"
+            "CREATE INDEX calls_thread ON call_records(target,tid,started,id,api);"
+            "CREATE INDEX calls_failed ON call_records(started,target,id,api) WHERE (flags & " +
             std::to_string(Failed) + ") != 0;"
-            "CREATE INDEX calls_pending ON calls(target,id) WHERE (ended IS NULL OR (flags & " +
+            "CREATE INDEX calls_pending ON call_records(target,id) WHERE (ended IS NULL OR (flags & " +
             std::to_string(AsyncPending) + ")!=0) AND (flags & " + std::to_string(Continuation) + ")=0;"
             "CREATE TABLE async_completions(target INTEGER,id INTEGER,observed INTEGER,control INTEGER,"
             " observer INTEGER,tid INTEGER,transferred INTEGER,status INTEGER,domain INTEGER,source INTEGER,"
@@ -94,6 +214,56 @@ TraceStore::TraceStore(const std::wstring& path)
             " PRIMARY KEY(target,base,epoch)) WITHOUT ROWID;"
             "CREATE TABLE diagnostics(target INTEGER, timestamp INTEGER, message TEXT);";
         Execute(schema.c_str());
+
+        // Expose the original entry and return blobs to ordinary SQLite readers, including binary and empty values.
+        Execute(std::format(R"sql(
+            CREATE VIEW call_inputs AS
+            SELECT r.rowid AS rowid,r.*,
+                CASE WHEN input_parts IS NULL THEN input ELSE
+                    (SELECT CAST(group_concat(CASE
+                        WHEN p.atom IS NULL AND (p.value->>0)=0 THEN zeroblob(p.value->>1)
+                        WHEN p.atom IS NULL AND (p.value->>0)<0 THEN substr(r.input,-(p.value->>0),p.value->>1)
+                        ELSE (SELECT substr(data,1+(coalesce(p.atom,p.value->>0)-1)%{0}*{1},
+                                 CASE WHEN p.atom IS NULL THEN p.value->>1 ELSE {1} END)
+                              FROM input_blocks WHERE id=(coalesce(p.atom,p.value->>0)-1)/{0}) END,'' ORDER BY p.key)
+                        AS BLOB)
+                     FROM json_each(r.input_parts) p)
+                END AS entry
+            FROM call_records r;
+
+            CREATE VIEW calls AS
+            SELECT target,id,tid,api,started,ended,parent,depth,caller,arguments,result,error,flags,entry AS input,
+                CASE WHEN output_length IS NULL OR length(output)=output_length THEN output
+                     WHEN length(output)=0 THEN entry
+                     ELSE (WITH original(data) AS MATERIALIZED (SELECT r.entry)
+                           SELECT CAST(group_concat(substr(CASE WHEN (p.value->>0)>0 THEN original.data ELSE r.output
+                               END,p.value->>0,p.value->>1),'' ORDER BY p.key) AS BLOB)
+                           FROM original,json_each(CAST(substr(r.output,1,instr(r.output,x'00')-1) AS TEXT)) p)
+                END AS output,module_epoch,adjusted_duration,rowid AS rowid
+            FROM call_inputs r;
+
+            CREATE TRIGGER calls_insert INSTEAD OF INSERT ON calls BEGIN
+                INSERT INTO call_records(rowid,target,id,tid,api,started,ended,parent,depth,caller,arguments,result,
+                    error,flags,input,output,module_epoch,adjusted_duration)
+                VALUES(NEW.rowid,NEW.target,NEW.id,NEW.tid,NEW.api,NEW.started,NEW.ended,NEW.parent,NEW.depth,
+                    NEW.caller,NEW.arguments,NEW.result,NEW.error,NEW.flags,NEW.input,NEW.output,
+                    coalesce(NEW.module_epoch,0),NEW.adjusted_duration);
+            END;
+            CREATE TRIGGER calls_update INSTEAD OF UPDATE ON calls BEGIN
+                UPDATE call_records SET rowid=NEW.rowid,target=NEW.target,id=NEW.id,tid=NEW.tid,api=NEW.api,
+                    started=NEW.started,ended=NEW.ended,parent=NEW.parent,depth=NEW.depth,caller=NEW.caller,
+                    arguments=NEW.arguments,result=NEW.result,error=NEW.error,flags=NEW.flags,
+                    input=CASE WHEN NEW.input IS OLD.input THEN input ELSE NEW.input END,
+                    input_parts=CASE WHEN NEW.input IS OLD.input THEN input_parts END,
+                    output=CASE WHEN NEW.input IS OLD.input AND NEW.output IS OLD.output
+                        THEN output ELSE NEW.output END,
+                    output_length=CASE WHEN NEW.input IS OLD.input AND NEW.output IS OLD.output THEN output_length END,
+                    module_epoch=NEW.module_epoch,adjusted_duration=NEW.adjusted_duration WHERE rowid=OLD.rowid;
+            END;
+            CREATE TRIGGER calls_delete INSTEAD OF DELETE ON calls BEGIN
+                DELETE FROM call_records WHERE rowid=OLD.rowid;
+            END;
+        )sql", BlocksPerPage, InputBlockBytes).c_str());
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
         FILETIME utc;
@@ -116,15 +286,33 @@ TraceStore::TraceStore(const std::wstring& path)
             sqlite3_reset(api.value);
         }
         Execute("COMMIT");
-        SqlCheck(sqlite3_prepare_v2(database_, "INSERT INTO calls(target,id,tid,api,started,parent,depth,caller,"
-            "arguments,flags,input,ended,result,error,output,module_epoch,adjusted_duration) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        SqlCheck(sqlite3_prepare_v2(database_, "INSERT INTO input_blocks(id,data) VALUES(?,?)",
+            -1, &insertBlock_, nullptr), database_);
+        sqlite3_rollback_hook(database_, [](void* context)
+        {
+            auto& store = *static_cast<TraceStore*>(context);
+            for (auto& group : store.inputBlocks_)
+            {
+                if (!group) continue;
+                for (auto& block : *group) block.id = 0;
+            }
+            store.blockPage_.clear();
+            ++store.blockPageId_;
+        }, this);
+        SqlCheck(sqlite3_prepare_v2(database_, "INSERT INTO call_records(target,id,tid,api,started,parent,depth,caller,"
+            "arguments,flags,input,ended,result,error,output,module_epoch,adjusted_duration,output_length,input_parts) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,coalesce(?18,?11),?12,?13,?14,"
+            "pack_return(?11,?15),?16,?17,length(?15),?19)",
             -1, &enter_, nullptr), database_);
-        auto leaveSql = std::string("UPDATE calls SET ended=?1, result=?2, error=?3,"
+        auto leaveSql = std::string("UPDATE call_records SET ended=?1, result=?2, error=?3,"
             " flags=CASE WHEN (flags & ") + std::to_string(AsyncCompleted) + ")!=0 THEN (?4 & ~" +
             std::to_string(AsyncLeaveClearMask) + ")|(flags & " + std::to_string(AsyncLeaveKeepMask) +
             ") ELSE ?4 END, output=CASE WHEN (flags & " + std::to_string(AsyncCompleted) +
-            ")!=0 THEN output ELSE ?5 END, adjusted_duration=?8 WHERE target=?6 AND id=?7";
+            ")!=0 THEN output WHEN length(?5)>0 THEN "
+            "pack_return((SELECT entry FROM call_inputs WHERE rowid=call_records.rowid),?5) ELSE ?5 END,"
+            " output_length=CASE WHEN (flags & " +
+            std::to_string(AsyncCompleted) + ")!=0 THEN output_length ELSE length(?5) END,"
+            " adjusted_duration=?8 WHERE target=?6 AND id=?7";
         SqlCheck(sqlite3_prepare_v2(database_, leaveSql.c_str(), -1, &leave_, nullptr), database_);
 
         // A second connection can copy committed WAL pages while the writer accepts the next batch.
@@ -144,6 +332,7 @@ TraceStore::TraceStore(const std::wstring& path)
     catch (...)
     {
         sqlite3_close(checkpointDatabase_);
+        sqlite3_finalize(insertBlock_);
         sqlite3_finalize(enter_);
         sqlite3_finalize(leave_);
         sqlite3_close(database_);
@@ -155,6 +344,7 @@ TraceStore::~TraceStore()
 {
     if (checkpoint_.valid()) checkpoint_.wait();
     sqlite3_close(checkpointDatabase_);
+    sqlite3_finalize(insertBlock_);
     sqlite3_finalize(enter_);
     sqlite3_finalize(leave_);
     if (database_) sqlite3_close(database_);
@@ -207,6 +397,7 @@ void TraceStore::Flush()
     }
     if (pending_)
     {
+        FlushInputBlocks();
         Statement totals(database_, "UPDATE session SET total_calls=?");
         totals.Exec(count_);
         Execute("COMMIT");
@@ -251,7 +442,7 @@ void TraceStore::TargetState(int64_t target, const std::wstring& state, bool exi
     {
         Flush();
         Begin();
-        auto sql = "UPDATE calls SET flags=flags|" + std::to_string(Continuation) +
+        auto sql = "UPDATE call_records SET flags=flags|" + std::to_string(Continuation) +
             " WHERE target=? AND ended IS NULL AND (flags & " + std::to_string(Continuation) + ")=0";
         Statement interrupted(database_, sql.c_str());
         interrupted.Exec(target);
@@ -341,7 +532,11 @@ void TraceStore::Add(int64_t target, const RecordView& record)
             event.arguments[8]);
         sqlite3_bind_blob64(completion.value, 13, record.payload.data(), bytes, SQLITE_STATIC);
         completion.Exec();
-        Statement update(database_, "UPDATE calls SET flags=(flags & ?1)|?2,output=?3 WHERE target=?4 AND id=?5");
+        if (record.payload.size() > bytes) FlushInputBlocks();
+        Statement update(database_, "UPDATE call_records SET flags=(flags & ?1)|?2,"
+            "output=CASE WHEN length(?3)>0 THEN "
+            "pack_return((SELECT entry FROM call_inputs WHERE rowid=call_records.rowid),?3) ELSE ?3 END,"
+            "output_length=length(?3) WHERE target=?4 AND id=?5");
         update.Bind(~static_cast<int64_t>(Failed | AsyncPending | AsyncCancelled));
         sqlite3_bind_int(update.value, 2, event.flags & (AsyncCompleted | AsyncCancelled | Failed));
         sqlite3_bind_blob64(
@@ -460,6 +655,7 @@ void TraceStore::Add(int64_t target, const RecordView& record)
     else
     {
         Begin();
+        if (!record.payload.empty()) FlushInputBlocks();
         auto statement = leave_;
         sqlite3_bind_int64(statement, 1, event.timestamp);
         sqlite3_bind_int64(statement, 2, event.result);
@@ -489,6 +685,106 @@ void TraceStore::RecycleEntry(Entries::iterator entry)
         reusableEntries_[reusableCount_++] = std::move(node);
         reusableBytes_ += bytes;
     }
+}
+
+void TraceStore::FlushInputBlocks()
+{
+    // Publish each immutable group before its calls become visible or a late return reads the entry.
+    if (blockPage_.empty()) return;
+    SqlCheck(sqlite3_bind_int64(insertBlock_, 1, blockPageId_), database_);
+    SqlCheck(sqlite3_bind_blob64(insertBlock_, 2, blockPage_.data(), blockPage_.size(), SQLITE_TRANSIENT), database_);
+    SqlCheck(sqlite3_step(insertBlock_), database_);
+    SqlCheck(sqlite3_reset(insertBlock_), database_);
+    blockPage_.clear();
+    ++blockPageId_;
+}
+
+sqlite3_int64 TraceStore::InputBlockId(const std::byte* data)
+{
+    // A hash selects a cache slot. Only an exact byte comparison can publish a reference.
+    uint64_t hash = Fnv1aOffsetBasis64, bits = 0;
+    for (size_t index = 0; index < InputBlockBytes; index += sizeof(uint64_t))
+    {
+        uint64_t word;
+        memcpy(&word, data + index, sizeof(word));
+        hash = (hash ^ word) * Fnv1aPrime64;
+        bits |= word;
+    }
+    if (!bits) return 0;
+
+    // Small recordings touch only a fraction of the dictionary's hash slots.
+    constexpr size_t slots = 8 * 1024 * 1024 / InputBlockBytes;
+    constexpr auto groupSize = std::tuple_size_v<InputBlockGroup>;
+    if (inputBlocks_.empty()) inputBlocks_.resize(slots / groupSize);
+    const auto slot = static_cast<size_t>(hash ^ (hash >> 32)) & (slots - 1);
+    auto& group = inputBlocks_[slot / groupSize];
+    if (!group) group = std::make_unique<InputBlockGroup>();
+    auto& block = (*group)[slot % groupSize];
+    if (block.hash != hash || memcmp(data, block.bytes.data(), InputBlockBytes) != 0)
+    {
+        block.hash = hash;
+        block.id = 0;
+        memcpy(block.bytes.data(), data, InputBlockBytes);
+        return -1;
+    }
+    if (block.id) return block.id;
+
+    // A spare block leaves room for SQLite's row header and separates consecutive pages' ranges.
+    if (blockPage_.size() == (BlocksPerPage - 1) * InputBlockBytes) FlushInputBlocks();
+    auto index = static_cast<sqlite3_int64>(blockPage_.size() / InputBlockBytes);
+    blockPage_.append(reinterpret_cast<const char*>(data), InputBlockBytes);
+    block.id = blockPageId_ * BlocksPerPage + index + 1;
+    return block.id;
+}
+
+void TraceStore::BindInputBlocks(std::span<const std::byte> input)
+{
+    if (input.size() < InputBlockBytes) return;
+
+    // A negative range selects literal bytes. Zero fills a range, and a positive ID selects a dictionary block.
+    inputParts_ = "[";
+    inputLiterals_.clear();
+    size_t firstLiteral = 0;
+    auto appendLiteral = [&](size_t end)
+    {
+        if (firstLiteral == end) return;
+        AppendRange(inputParts_, -1 - static_cast<sqlite3_int64>(inputLiterals_.size()), end - firstLiteral);
+        inputLiterals_.append(reinterpret_cast<const char*>(input.data() + firstLiteral), end - firstLiteral);
+    };
+    sqlite3_int64 range = 0, next = 0;
+    size_t rangeBytes = 0;
+    auto appendShared = [&]
+    {
+        if (range > 0 && rangeBytes == InputBlockBytes)
+        {
+            AppendNumber(inputParts_, range);
+            inputParts_ += ',';
+        }
+        else AppendRange(inputParts_, range, rangeBytes);
+    };
+    for (size_t offset = 0; offset + InputBlockBytes <= input.size(); offset += InputBlockBytes)
+    {
+        auto id = InputBlockId(input.data() + offset);
+        if (id < 0) continue;
+        if (rangeBytes && firstLiteral == offset && id == next) rangeBytes += InputBlockBytes;
+        else
+        {
+            if (rangeBytes) appendShared();
+            appendLiteral(offset);
+            range = id;
+            rangeBytes = InputBlockBytes;
+        }
+        next = id ? id + 1 : 0;
+        firstLiteral = offset + InputBlockBytes;
+    }
+    if (!rangeBytes) return;
+    appendShared();
+    appendLiteral(input.size());
+    inputParts_.back() = ']';
+    if (inputParts_.size() + inputLiterals_.size() >= input.size()) return;
+    SqlCheck(sqlite3_bind_blob64(enter_, 18, inputLiterals_.data(), inputLiterals_.size(), SQLITE_STATIC), database_);
+    SqlCheck(sqlite3_bind_text64(enter_, 19, inputParts_.data(), inputParts_.size(), SQLITE_STATIC, SQLITE_UTF8),
+        database_);
 }
 
 void TraceStore::WriteEntry(int64_t target, const RecordView& entry, const RecordView* leaving)
@@ -521,6 +817,7 @@ void TraceStore::WriteEntry(int64_t target, const RecordView& entry, const Recor
     sqlite3_bind_blob(statement, 9, event.arguments, static_cast<int>(argumentCount * sizeof(uint64_t)), SQLITE_STATIC);
     sqlite3_bind_int(statement, 10, leaving ? leaving->event.flags : event.flags);
     sqlite3_bind_blob64(statement, 11, entry.payload.data(), entry.payload.size(), SQLITE_STATIC);
+    BindInputBlocks(entry.payload);
     sqlite3_bind_int64(statement, 16, static_cast<sqlite3_int64>(event.moduleEpoch));
     if (leaving)
     {

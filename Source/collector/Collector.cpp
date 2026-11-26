@@ -710,9 +710,16 @@ Json Collector::Dispatch(const Json& request)
     }
     if (command == "spyPoll") return spy_.Poll();
     if (command == "spyStop") return spy_.Poll(true);
+    if (command == "validateCatalog")
+    {
+        // Validation may replace the display metadata with a complete recording catalog.
+        std::unique_lock catalogLock(CatalogAccess);
+        PrepareApiCatalog();
+        return Json::object();
+    }
     if (command == "hello")
     {
-        PrepareApiCatalog();
+        PrepareApiCatalog(CatalogUse::Metadata);
         auto catalog = Json::array(), categories = Json::array();
         for (const auto& definition : CategoryDefinitions)
             categories.push_back({{"id", static_cast<uint32_t>(definition.id)}, {"name", definition.name},
@@ -810,7 +817,7 @@ Json Collector::Dispatch(const Json& request)
         // Join the previous worker before changing controller definitions for the next capture.
         session_.reset();
         std::unique_lock catalogLock(CatalogAccess);
-        PrepareApiCatalog(true);
+        PrepareApiCatalog(CatalogUse::Refresh);
         session_ = std::make_unique<Session>(database, options, command == "attach" ? pid : 0,
             executable, Wide(request.value("arguments", std::string{})));
         return Status();
@@ -917,7 +924,7 @@ Json Collector::Dispatch(const Json& request)
     }
     if (command == "page" || command == "details")
     {
-        PrepareApiCatalog();
+        PrepareApiCatalog(CatalogUse::Metadata);
         // Keep list transfers bounded; an indexed cursor supports loading a complete view in batches.
         Query query;
         query.target = static_cast<int64_t>(Number(request, "target", 0, INT64_MAX));
@@ -999,7 +1006,7 @@ Json Collector::Dispatch(const Json& request)
     }
     if (IsViewCommand(command))
     {
-        PrepareApiCatalog();
+        PrepareApiCatalog(CatalogUse::Metadata);
         return View(command, request);
     }
     if (command == "exports")

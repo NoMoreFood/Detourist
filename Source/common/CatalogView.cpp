@@ -209,22 +209,29 @@ const uint32_t* CatalogView::SuccessValues(const CatalogPlan& plan) const
 
 bool BindApiDefinitions(const CatalogView& catalog)
 {
-    // Validate every built-in before replacing pointers into the shared capture image.
+    // Recording requires a complete calling contract for every built-in hook.
     for (uint32_t index = 0; index < catalog.Header()->builtinCount; ++index)
     {
         const auto& source = catalog.Builtins()[index];
-        auto module = catalog.Text(source.module), name = catalog.Text(source.name);
-        auto description = catalog.WideText(source.description);
-        auto nativeName = catalog.Text(source.nativeName);
-        if (source.id != index || source.argumentCount > MaximumArguments || !module || !name || !description ||
-            !nativeName)
-            return false;
         auto plan = catalog.BuiltinPlan(static_cast<Api>(index));
         if ((IsWin32Api(static_cast<Api>(index)) || IsNativeApi(static_cast<Api>(index)) ||
             IsWin32uApi(static_cast<Api>(index))) && (!plan || sizeof(void*) == 8 && !plan->signature.supported ||
             plan->argumentCount != source.argumentCount &&
                 (!plan->rawTailStart || plan->argumentCount > source.argumentCount) ||
             !catalog.Parameters(*plan) || !catalog.Members(*plan)))
+            return false;
+    }
+    return BindApiMetadata(catalog);
+}
+
+bool BindApiMetadata(const CatalogView& catalog)
+{
+    // Validate all display fields before publishing pointers into the new snapshot.
+    for (uint32_t index = 0; index < catalog.Header()->builtinCount; ++index)
+    {
+        const auto& source = catalog.Builtins()[index];
+        if (source.id != index || source.argumentCount > MaximumArguments || !catalog.Text(source.module) ||
+            !catalog.Text(source.name) || !catalog.WideText(source.description) || !catalog.Text(source.nativeName))
             return false;
     }
     if (!BindApiCategories(catalog)) return false;

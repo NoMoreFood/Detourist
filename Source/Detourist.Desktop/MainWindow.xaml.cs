@@ -152,10 +152,16 @@ public partial class MainWindow : Window
             settings.NoiseProfiles = hello.Items("noiseProfiles").Select(item => new NoiseProfileInfo(
                 item.Text("name"), item.Text("description"),
                 item.Items("apis").Select(api => api.GetString()!).ToArray())).ToArray();
+
+            // Decode signatures and sort search suggestions away from the window's dispatcher.
             var categoryNames = categories.ToDictionary(item => item.Id, item => item.Name);
-            catalog = hello.Items("catalog").Select(item => ApiInfo.FromJson(item, categoryNames)).ToArray();
-            apiNames = [.. catalog.Select(api => api.Name).Where(name => !name.Contains(' ')).Distinct()
-                .OrderBy(name => name.Length).ThenBy(name => name, StringComparer.OrdinalIgnoreCase)];
+            (catalog, apiNames) = await Task.Run(() =>
+            {
+                var apis = hello.Items("catalog").Select(item => ApiInfo.FromJson(item, categoryNames)).ToArray();
+                var names = apis.Select(api => api.Name).Where(name => !name.Contains(' ')).Distinct()
+                    .OrderBy(name => name.Length).ThenBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+                return (apis, names);
+            });
             settings.Resolve(catalog, categories, ulong.Parse(hello.Text("allApis"), CultureInfo.InvariantCulture),
                 ulong.Parse(hello.Text("allCategories"), CultureInfo.InvariantCulture));
             updating = true;

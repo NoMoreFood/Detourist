@@ -201,6 +201,7 @@ private:
 
 bool PublicFailure(Api api, uint64_t result);
 bool CatalogModuleMatches(const char* pattern, const char* module);
+bool BindApiMetadata(const CatalogView& catalog);
 bool BindApiDefinitions(const CatalogView& catalog);
 static_assert(sizeof(ExportSignature) == 44 && sizeof(ExportParameter) == 24 && sizeof(ExportMember) == 20 &&
     sizeof(CatalogPlan) == 96 && sizeof(CatalogInterface) == 32 && sizeof(CatalogOrdinal) == 12 &&

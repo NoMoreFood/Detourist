@@ -22,9 +22,9 @@ def slow_database(source, destination):
     # An expanded trace relation makes SQLite spend time inside a step, beyond the view's row-slice budget.
     with open_trace(source) as connection, open_trace(destination) as output:
         connection.backup(output)
-        output.executescript('ALTER TABLE calls RENAME TO recorded_calls; CREATE VIEW calls AS '
+        output.executescript('DROP VIEW calls; CREATE VIEW calls AS '
             'WITH RECURSIVE copies(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM copies WHERE n<1000000000) '
-            'SELECT c.rowid AS rowid,c.* FROM recorded_calls c CROSS JOIN copies;')
+            'SELECT c.rowid AS rowid,c.* FROM call_records c CROSS JOIN copies;')
 
 
 def queries(collector_path, target):
@@ -75,9 +75,13 @@ def queries(collector_path, target):
             query = collector.send('view', database=str(root / 'slow.db'))
             time.sleep(.1)
             start = time.monotonic()
-            seed(collector, target, root / 'next.db')
-            assert 'canceled' in collector.receive(query, expected=False)
+            assert collector.call('hello')['catalog']
+            launch = collector.send('launch', database=str(root / 'next.db'), executable=str(target),
+                arguments='--leaf 1', apiMask=api['mask'], followChildren=False)
+            assert 'canceled' in collector.receive(query, expected=False, timeout=5)
             assert time.monotonic() - start < 5, 'A new capture waited for stale query work.'
+            collector.receive(launch)
+            collector.wait(lambda status: status['finished'])
             print('Slow query: cancellation, deadline, EOF cleanup and subsequent queries passed.', flush=True)
         finally:
             collector.close()

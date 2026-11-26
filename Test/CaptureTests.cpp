@@ -1135,6 +1135,132 @@ void StorageFailures(const std::wstring& output)
     }
 }
 
+void ReturnBufferReuse(const std::wstring& output)
+{
+    auto path = output + L"\\return-buffers.db";
+    TraceStore store(path);
+    auto target = store.AddTarget(100, L"buffers.exe", 0, AllApis);
+
+    // Interleave literals and references, including reordered values with the same parameter and changed headers.
+    std::array<std::byte, 257> ascending{}, descending{};
+    for (size_t i = 0; i < ascending.size(); ++i)
+    {
+        ascending[i] = static_cast<std::byte>(i & 255);
+        descending[i] = static_cast<std::byte>(255 - (i & 255));
+    }
+    auto changed = ascending;
+    memcpy(changed.data() + 71, "return-only", 11);
+    auto append = [](std::vector<std::byte>& payload, uint32_t parameter, uint32_t flags, const auto& data)
+    {
+        Value header{parameter, ValueKind::Bytes, flags, static_cast<uint32_t>(data.size()),
+            data.size() + ((flags & Truncated) != 0)};
+        auto bytes = std::as_bytes(std::span(&header, 1));
+        payload.insert(payload.end(), bytes.begin(), bytes.end());
+        payload.insert(payload.end(), data.begin(), data.end());
+    };
+    std::vector<std::byte> input, mixed;
+    append(input, 1, 0, ascending);
+    append(input, 1, MemberData, descending);
+    append(input, 2, 0, descending);
+    append(mixed, 2, 0, descending);
+    append(mixed, 3, 0, changed);
+    append(mixed, 1, Truncated, ascending);
+    append(mixed, 1, MemberData, descending);
+    auto malformed = mixed;
+    malformed.push_back(std::byte{0xff});
+
+    // Read completed, published and asynchronous returns through the same detail query used by the collector.
+    auto record = [&](uint64_t id, std::span<const std::byte> expected, bool publish = false, bool complete = false,
+        std::span<const std::byte> entering = {})
+    {
+        if (entering.empty()) entering = input;
+        auto event = EnterRecord(Api::ReadFile, 1, id).event;
+        store.Add(target, {event, entering});
+        Query detail{.target = target, .callId = id, .includePayload = true};
+        if (publish)
+        {
+            store.Flush();
+            auto pending = TraceStore::ReadPage(path, detail).calls;
+            Require(pending.size() == 1 && std::ranges::equal(pending[0].input, entering) && pending[0].output.empty(),
+                "A pending entry exposed a return buffer.");
+        }
+        if (complete)
+        {
+            event.kind = EventKind::AsyncCompletion;
+            event.flags = AsyncCompleted;
+            event.arguments[4] = static_cast<uint32_t>(AsyncIoDomain::Win32);
+            event.arguments[5] = static_cast<uint32_t>(AsyncIoSource::Result);
+            store.Add(target, {event, expected});
+        }
+        event.kind = EventKind::Leave;
+        event.flags = complete ? AsyncPending : 0u;
+        store.Add(target, {event, complete ? entering : expected});
+        store.Flush();
+        auto rows = TraceStore::ReadPage(path, detail).calls;
+        Require(rows.size() == 1 && std::ranges::equal(rows[0].input, entering) &&
+            std::ranges::equal(rows[0].output, expected),
+            "The stored buffer failed to reproduce the original entry and return bytes.");
+    };
+    record(1, input);
+    record(2, mixed);
+    record(3, mixed, true);
+    record(4, mixed, false, true);
+    record(5, malformed);
+    record(6, {});
+    std::vector<std::byte> alias;
+    append(alias, 7, 0, ascending);
+    record(7, alias);
+
+    // Repeat a snapshot spanning multiple dictionary pages and a zero-filled tail, then change one byte.
+    std::vector<std::byte> pageData(24 * 1024 - sizeof(Value)), pages;
+    for (size_t offset = 0; offset < 16 * 1024; offset += sizeof(uint64_t))
+    {
+        uint64_t marker = offset;
+        memcpy(pageData.data() + offset, &marker, sizeof(marker));
+    }
+    append(pages, 4, 0, pageData);
+    record(8, pages, false, false, pages);
+    record(9, pages, true, false, pages);
+    auto amended = pages;
+    amended.back() = std::byte{0xf1};
+    record(10, pages, false, true, amended);
+    store.Finish();
+
+    // Inspect physical storage and search return-only data through the public trace view.
+    sqlite3* raw = nullptr;
+    auto result = sqlite3_open_v2(Utf8(path).c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(raw, sqlite3_close);
+    SqlCheck(result, raw);
+    Statement sizes(db.get(), "SELECT count(*) FROM call_records WHERE (id=1 AND length(output)=0 AND output_length>0)"
+        " OR ((id BETWEEN 2 AND 4 OR id=7) AND length(output)>0 AND length(output)<output_length)"
+        " OR (id=5 AND length(output)=output_length)");
+    TraceView found(path, {.filter = "text:return-only"});
+    while (!found.Complete()) found.Advance(100);
+    Require(sizes.Next() && sqlite3_column_int(sizes.value, 0) == 6 && found.Count() == 4,
+        "Return buffers were stored twice or their text was unavailable to a live view.");
+
+    // Edits to one call must preserve the original return and the shared entry bytes used by other calls.
+    Statement(db.get(), "UPDATE calls SET tid=9 WHERE id=3").Exec();
+    Statement blocks(db.get(), "SELECT count(*) FROM call_records WHERE id BETWEEN 2 AND 7 AND input_parts IS NOT NULL"
+        " AND length(input)+length(input_parts)<?");
+    blocks.Bind(input.size());
+    Require(blocks.Next() && sqlite3_column_int(blocks.value, 0) == 6, "Repeated entry blocks were stored inline.");
+    Statement grouped(db.get(), "SELECT length(input)+length(input_parts),(SELECT count(*) FROM input_blocks)"
+        " FROM call_records WHERE id=9");
+    Require(grouped.Next() && sqlite3_column_int(grouped.value, 0) < static_cast<int>(pages.size() / 2) &&
+        sqlite3_column_int(grouped.value, 1) > 1, "The repeated multi-page snapshot did not reuse its blocks.");
+    Statement(db.get(), "UPDATE calls SET input=x'01' WHERE id=3").Exec();
+    Query edited{.target = target, .callId = 3, .includePayload = true};
+    auto rows = TraceStore::ReadPage(path, edited).calls;
+    Require(rows.size() == 1 && rows[0].input == std::vector{std::byte{1}} && rows[0].output == mixed,
+        "Replacing the entry bytes changed the call's return.");
+    Statement(db.get(), "DELETE FROM calls WHERE id IN (1,2,3)").Exec();
+    edited.callId = 4;
+    rows = TraceStore::ReadPage(path, edited).calls;
+    Require(rows.size() == 1 && rows[0].input == input && rows[0].output == mixed,
+        "Deleting earlier calls invalidated a shared block.");
+}
+
 void CheckpointWithReader(const std::wstring& output)
 {
     // Hold a snapshot while enough completed calls accumulate to require multiple checkpoints.
@@ -1162,6 +1288,12 @@ void CheckpointWithReader(const std::wstring& output)
     leaving.event.kind = EventKind::Leave;
     for (int id = 1; id <= calls; ++id)
     {
+        // Distinct blocks keep the WAL large enough to exercise checkpoints while the reader pins its snapshot.
+        for (size_t offset = sizeof(value); offset < entry.payload.size(); offset += sizeof(uint64_t))
+        {
+            uint64_t marker = (static_cast<uint64_t>(id) << 32) | offset;
+            memcpy(entry.payload.data() + offset, &marker, sizeof(marker));
+        }
         entry.event.callId = leaving.event.callId = id;
         store.Add(target, entry);
         store.Add(target, leaving);
@@ -1315,6 +1447,7 @@ int wmain(int argc, wchar_t** argv)
             FrozenPage(output);
             CompleteViewCursor(output);
             StorageFailures(output);
+            ReturnBufferReuse(output);
             CheckpointWithReader(output);
             TraceSizeThreshold(output);
             TransportPressure();

@@ -56,9 +56,9 @@ public static partial class Program
                 $"SELECT 1,n,1,{api.Number("id")},n*10,n*10+2,0,0,0,0,0,0,zeroblob(40) FROM ids; " +
                 "UPDATE session SET total_calls=1500;");
             WriteTrace(database, $"VACUUM INTO '{slowDatabase.Replace("'", "''")}';");
-            WriteTrace(slowDatabase, "ALTER TABLE calls RENAME TO recorded_calls; CREATE VIEW calls AS " +
+            WriteTrace(slowDatabase, "DROP VIEW calls; CREATE VIEW calls AS " +
                 "WITH RECURSIVE copies(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM copies WHERE n<1000000000) " +
-                "SELECT c.rowid AS rowid,c.* FROM recorded_calls c CROSS JOIN copies;");
+                "SELECT c.rowid AS rowid,c.* FROM call_records c CROSS JOIN copies;");
 
             using var owner = new CallView(client);
             var list = new CallList();

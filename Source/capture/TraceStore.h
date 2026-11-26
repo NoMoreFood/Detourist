@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,7 +18,7 @@
 namespace Detourist
 {
 constexpr int TraceApplicationId = 0x44545252;
-constexpr int TraceSchemaVersion = 11;
+constexpr int TraceSchemaVersion = 13;
 // Query work carries its cancellation and deadline across every SQLite connection on its worker.
 struct QueryWork
 {
@@ -225,12 +226,28 @@ private:
     void Execute(const char* sql);
     void Begin();
     void WriteEntry(int64_t target, const RecordView& entry, const RecordView* leaving = nullptr);
+    void BindInputBlocks(std::span<const std::byte> input);
+    sqlite3_int64 InputBlockId(const std::byte* data);
+    void FlushInputBlocks();
     sqlite3* database_ = nullptr;
     sqlite3* checkpointDatabase_ = nullptr;
     std::future<void> checkpoint_;
     int walFrames_ = 0, lastCheckpointFrame_ = 0;
     sqlite3_stmt* enter_ = nullptr;
     sqlite3_stmt* leave_ = nullptr;
+    sqlite3_stmt* insertBlock_ = nullptr;
+    static constexpr size_t InputBlockBytes = 64;
+    static constexpr sqlite3_int64 BlocksPerPage = 8192 / InputBlockBytes;
+    struct InputBlock
+    {
+        uint64_t hash = 0;
+        sqlite3_int64 id = 0;
+        std::array<std::byte, InputBlockBytes> bytes{};
+    };
+    using InputBlockGroup = std::array<InputBlock, 32>;
+    std::vector<std::unique_ptr<InputBlockGroup>> inputBlocks_;
+    std::string inputParts_, inputLiterals_, blockPage_;
+    sqlite3_int64 blockPageId_ = 0;
     uint32_t pending_ = 0;
     uint64_t count_ = 0;
     size_t cachedBytes_ = 0;
@@ -433,7 +450,7 @@ private:
     std::string ScanSql(const std::string& range) const;
     static Key ColumnKey(sqlite3_stmt* statement, int first = 0);
     void BindKey(sqlite3_stmt* statement, int first, const Key& key) const;
-    void Append(const Key& key, int64_t row);
+    void Append(sqlite3_stmt* call);
     void Thin();
     bool Scan(uint32_t budgetMilliseconds);
     bool Extend(bool includeNew);
@@ -457,6 +474,7 @@ private:
     int64_t dataVersion_ = -1;
     bool moduleFilter_ = false;
     std::unordered_map<uint64_t, Totals> totals_;
+    std::vector<uint32_t> summaryOrder_;
     int64_t summaryRow_ = 0;
     int64_t summaryBound_ = 0;
     uint64_t summaryRevision_ = 0;
