@@ -81,7 +81,8 @@ public static partial class Program
             {
                 WriteTrace(database, "INSERT INTO calls(target,id,tid,api,started,ended,parent,depth,caller," +
                     "result,error," +
-                    "flags,arguments,input,output) SELECT target,1502,tid,api,16000,16002,parent,depth,caller," +
+                    "flags,arguments,input,output) SELECT target,1502,tid,(SELECT id FROM apis WHERE target=0 " +
+                    "AND name='ReadFile'),16000,16002,parent,depth,caller," +
                     "result,error,flags,arguments,input,output FROM calls WHERE id=1; " +
                     "UPDATE session SET total_calls=1502;");
                 await owner.Advance(first: 0, last: 127);
@@ -243,6 +244,7 @@ public static partial class Program
                     await Task.Delay(25);
                 }
                 var displayedSummary = summaryGrid.ItemsSource;
+                summaryGrid.SelectAll();
                 var summaryDeadline = Field("nextSummary");
                 var due = (DateTime)summaryDeadline.GetValue(main)!;
                 var mainOwner = (CallView)Field("activeView").GetValue(main)!;
@@ -264,6 +266,9 @@ public static partial class Program
                         "An idle view left a throttled summary refresh pending.");
                     await Task.Delay(25);
                 }
+                Require(summaryGrid.SelectedItems.Count == 2 &&
+                    summaryGrid.SelectedItems.Cast<SummaryItem>().Sum(item => item.Calls) == 1503,
+                    "Refreshing live totals lost selected APIs or retained their old counts.");
                 WriteTrace(database, "INSERT INTO calls(target,id,tid,api,started,ended,parent,depth,caller,result," +
                     "error,flags,arguments) SELECT target,1504,tid,api,16020,16022,parent,depth,caller,result," +
                     "error,flags,arguments FROM calls WHERE id=1; UPDATE session SET total_calls=1504;");

@@ -111,7 +111,8 @@ public class ToolWindow : Window
     internal static void SelectContextRow(object sender, RoutedEventArgs e)
     {
         if (sender is DataGrid grid && e.OriginalSource is DependencyObject source &&
-            ItemsControl.ContainerFromElement(grid, source) is DataGridRow row) grid.SelectedItem = row.Item;
+            ItemsControl.ContainerFromElement(grid, source) is DataGridRow { IsSelected: false } row)
+            grid.SelectedItem = row.Item;
     }
 
     protected static ScrollViewer Scroll(UIElement content, Thickness padding = default) => new()

@@ -51,10 +51,13 @@ TraceStore::TraceStore(const std::wstring& path)
     try
     {
         sqlite3_busy_timeout(database_, TraceWriteBusyTimeoutMs);
-        auto schema = std::string(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192;"
-            "PRAGMA wal_autocheckpoint=8192;"
-            "PRAGMA application_id=") + std::to_string(TraceApplicationId) +
+
+        // Grow the trace to each checkpoint's final extent before copying its pages on Windows.
+        int pageBytes = 8192;
+        SqlCheck(sqlite3_file_control(database_, "main", SQLITE_FCNTL_CHUNK_SIZE, &pageBytes), database_);
+        auto schema = "PRAGMA page_size=" + std::to_string(pageBytes) +
+            "; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192;"
+            "PRAGMA wal_autocheckpoint=4096; PRAGMA application_id=" + std::to_string(TraceApplicationId) +
             "; PRAGMA user_version=" + std::to_string(TraceSchemaVersion) + ";"
             "CREATE TABLE session(frequency INTEGER, start_clock INTEGER, start_utc INTEGER, total_calls INTEGER);"
             "CREATE TABLE apis(target INTEGER, id INTEGER, module TEXT, name TEXT, parameters TEXT,"

@@ -378,8 +378,8 @@
                                                     Visibility="Collapsed" ElementStyle="{StaticResource CellText}" />
                             </DataGrid.Columns>
                         </DataGrid>
-                        <DataGrid x:Name="SummaryGrid" Visibility="Collapsed" CanUserSortColumns="True"
-                                  Sorting="SummarySorting" MouseDoubleClick="SummaryActivated"
+                        <DataGrid x:Name="SummaryGrid" Visibility="Collapsed" SelectionMode="Extended"
+                                  CanUserSortColumns="True" Sorting="SummarySorting" MouseDoubleClick="SummaryActivated"
                                   PreviewKeyDown="SummaryKeyDown" ContextMenuOpening="SummaryContextOpening"
                                   FontFamily="Consolas" FontSize="12" AutomationProperties.Name="Calls by API"
                                   ToolTip="Durations include capture overhead.">

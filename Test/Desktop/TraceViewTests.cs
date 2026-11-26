@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 
@@ -73,6 +74,7 @@ public static partial class Program
             var list = (CallList)grid.ItemsSource;
             var results = (TextBlock)main.FindName("ResultsText");
             var search = (TextBox)main.FindName("ApiSearch");
+            var debounce = (DispatcherTimer)Field("searchTimer")!;
             var order = (ComboBox)main.FindName("OrderCombo");
             var process = (ComboBox)main.FindName("ProcessCombo");
             var thread = (ComboBox)main.FindName("ThreadCombo");
@@ -93,7 +95,7 @@ public static partial class Program
                             $"{grid.Items.Count} rows, offset {scroll?.VerticalOffset}, " +
                             $"viewport {scroll?.ViewportHeight}, selected {grid.SelectedIndex}, " +
                             $"view {Field("view")}/{Field("viewGeneration")}, opening {Field("opening")}, " +
-                            $"filter pending {((DispatcherTimer)Field("searchTimer")!).IsEnabled}.");
+                            $"filter pending {debounce.IsEnabled}.");
                     }
                     Require(((Border)main.FindName("ErrorBanner")).Visibility != Visibility.Visible,
                         ((TextBlock)main.FindName("ErrorText")).Text);
@@ -111,7 +113,8 @@ public static partial class Program
             }
             async Task Showing(IReadOnlyList<CallItem> expected, string description)
             {
-                await Until(() => results.Text.EndsWith("total") && grid.Items.Count == expected.Count);
+                await Until(() => !debounce.IsEnabled && results.Text.EndsWith("total") &&
+                    grid.Items.Count == expected.Count);
                 foreach (var first in new[] { 0, Math.Max(0, expected.Count / 2 - 40),
                     Math.Max(0, expected.Count - 90) }.Distinct())
                 {
@@ -381,7 +384,7 @@ public static partial class Program
             await Until(() => fromApp.IsChecked == false);
             await Showing(all, "Clearing the caller filter did not restore the recorded view.");
 
-            // The summary totals the listed calls per API and narrows the list to one of them.
+            // The summary totals the listed calls and filters them by the selected API rows.
             var summaryCheck = (CheckBox)main.FindName("SummaryCheck");
             var summaryGrid = (DataGrid)main.FindName("SummaryGrid");
             summaryCheck.IsChecked = true;
@@ -393,14 +396,58 @@ public static partial class Program
                     call.Name == "WriteFile") && grid.Visibility == Visibility.Collapsed,
                 "The summary did not total the listed calls by API.");
             await SaveView(main, "investigation-summary");
+            ContextMenu SummaryMenu(SummaryItem api)
+            {
+                summaryGrid.ScrollIntoView(api);
+                summaryGrid.UpdateLayout();
+                var row = (DataGridRow)summaryGrid.ItemContainerGenerator.ContainerFromItem(api);
+                var opening = (ContextMenuEventArgs)Activator.CreateInstance(typeof(ContextMenuEventArgs),
+                    BindingFlags.Instance | BindingFlags.NonPublic, null, [row, true, 1d, 1d], null)!;
+                row.RaiseEvent(opening);
+                return summaryGrid.ContextMenu;
+            }
             var chosen = apis.First(api => api.Name == "WriteFile");
-            summaryGrid.SelectedItem = chosen;
-            Invoke("ShowSummaryApi", false);
+            summaryGrid.SelectedItem = apis.First(api => api.Name == "ReadFile");
+            SummaryMenu(chosen).Items.OfType<MenuItem>().Single(item => Equals(item.Header, "Show Only API: WriteFile"))
+                .RaiseEvent(click);
             await Showing(Matching(call => call.Name == "WriteFile" && call.Module == chosen.Module),
                 "Narrowing from the summary selected the wrong calls.");
             Require(summaryCheck.IsChecked == false && grid.Visibility == Visibility.Visible &&
                 search.Text == $"{Path.GetFileNameWithoutExtension(chosen.Module)}!=WriteFile",
                 "Narrowing from the summary did not return to the calls.");
+
+            // Hiding a group preserves the current filter and keeps the remaining APIs in summary mode.
+            var files = Matching(call => Named(call, "File"));
+            search.Text = "File";
+            summaryCheck.IsChecked = true;
+            await Until(() => results.Text.EndsWith($" · {files.Count:N0} calls", StringComparison.Ordinal));
+            var hidden = summaryGrid.Items.Cast<SummaryItem>().Where(api => api.Name is "WriteFile" or "ReadFile")
+                .ToArray();
+            Require(hidden.Length >= 2, "The summary fixture needs multiple file APIs.");
+            foreach (var api in hidden) summaryGrid.SelectedItems.Add(api);
+            var menuItems = SummaryMenu(hidden[^1]).Items.OfType<MenuItem>().ToArray();
+            Require(menuItems.Any(item => Equals(item.Header, "Copy Selected Rows")) &&
+                menuItems.Any(item => Equals(item.Header, $"Show Only {hidden.Length} APIs")),
+                "Opening a selected row's menu discarded the other selected APIs.");
+            menuItems.Single(item => Equals(item.Header, $"Hide {hidden.Length} APIs")).RaiseEvent(click);
+            var remaining = files.Count - hidden.Sum(api => api.Calls);
+            await Until(() => results.Text.EndsWith($" · {remaining:N0} calls", StringComparison.Ordinal));
+            Require(summaryCheck.IsChecked == true && search.Text.StartsWith("File -", StringComparison.Ordinal) &&
+                summaryGrid.Items.Cast<SummaryItem>().All(api => api.Name is not ("WriteFile" or "ReadFile")),
+                "Hiding the selected APIs did not preserve the filter and the remaining summary rows.");
+
+            // Enter opens the union of the selected APIs within the filtered view.
+            var keptFilter = search.Text;
+            var opened = summaryGrid.Items.Cast<SummaryItem>().Take(2).ToArray();
+            Require(opened.Length == 2, "The filtered summary fixture needs two remaining APIs.");
+            foreach (var api in opened) summaryGrid.SelectedItems.Add(api);
+            summaryGrid.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, PresentationSource.FromVisual(main), 0,
+                Key.Enter) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+            await Showing(files.Where(call => opened.Any(api => api.Module == call.Module && api.Name == call.Name))
+                .ToList(), "Opening multiple summary rows selected the wrong calls.");
+            Require(summaryCheck.IsChecked == false &&
+                search.Text.StartsWith(keptFilter + " ", StringComparison.Ordinal),
+                "Opening the selected APIs discarded the existing filter or stayed in the summary.");
 
             // Exports write every listed call in list order.
             search.Text = "WriteFile";
@@ -539,7 +586,6 @@ public static partial class Program
             await Showing(all, "Returning from the timeline selection test did not restore the trace.");
 
             // Applying an order consumes the typed filter so its delayed refresh cannot undo a later seek.
-            var debounce = (DispatcherTimer)Field("searchTimer")!;
             var interval = debounce.Interval;
             debounce.Interval = TimeSpan.FromSeconds(2);
             try

@@ -148,7 +148,12 @@ public partial class MainWindow
         ApiSearch.Text = string.Join(' ', terms);
     }
 
-    private static string ExactApi(string name) => name.Contains(' ') ? $"\"={name}\"" : "=" + name;
+    private static string ExactApi(string name, string module = "")
+    {
+        var prefix = Path.GetFileNameWithoutExtension(module);
+        var term = prefix.Length == 0 ? "=" + name : $"{prefix}!={name}";
+        return term.IndexOfAny([' ', '\t']) >= 0 ? $"\"{term}\"" : term;
+    }
 
     private void FromAppChanged(object sender, RoutedEventArgs e)
     {
@@ -437,16 +442,17 @@ public partial class MainWindow
             var rows = items.Select(item => SummaryItem.FromJson(item, listed)).OrderByDescending(item => item.Calls)
                 .ToList();
 
-            // A refreshed summary keeps the chosen ordering and row.
+            // A refreshed summary keeps the sort order and selected APIs as their counts change.
             var sorting = SummaryGrid.Items.SortDescriptions.ToArray();
             var directions = SummaryGrid.Columns.Select(column => column.SortDirection).ToArray();
-            var chosen = SummaryGrid.SelectedItem as SummaryItem;
+            var chosen = SummaryGrid.SelectedItems.Cast<SummaryItem>()
+                .Select(row => (row.Module, row.Name)).ToHashSet();
             SummaryGrid.ItemsSource = rows;
             foreach (var description in sorting) SummaryGrid.Items.SortDescriptions.Add(description);
             for (var index = 0; index < directions.Length; ++index)
                 SummaryGrid.Columns[index].SortDirection = directions[index];
-            SummaryGrid.SelectedItem = rows.FirstOrDefault(row => row.Module == chosen?.Module &&
-                row.Name == chosen.Name);
+            foreach (var row in rows)
+                if (chosen.Contains((row.Module, row.Name))) SummaryGrid.SelectedItems.Add(row);
             summaryText = $"{rows.Count:N0} {(rows.Count == 1 ? "API" : "APIs")} · {listed:N0} calls";
             nextSummary = DateTime.UtcNow.AddSeconds(3);
         }
@@ -469,28 +475,31 @@ public partial class MainWindow
         e.Column.SortDirection = ListSortDirection.Descending;
     }
 
-    private void ShowSummaryApi(bool hide)
+    // Snapshot the selection in display order for commands that can outlive a summary refresh.
+    private SummaryItem[] SelectedSummaryRows() => [.. SummaryGrid.Items.Cast<SummaryItem>()
+        .Intersect(SummaryGrid.SelectedItems.Cast<SummaryItem>())];
+
+    private void FilterSummary(SummaryItem[] rows, bool hide)
     {
-        // Narrowing to one API returns to its calls; hiding one keeps the summary open.
-        if (SummaryGrid.SelectedItem is not SummaryItem item) return;
-        var module = Path.GetFileNameWithoutExtension(item.Module);
-        var term = (module.Length > 0 && !module.Contains(' ') ? module + "!=" : "=") + item.Name;
-        if (term.Contains(' ')) term = $"\"{term}\"";
+        // Match any selected API within the current display filter.
+        if (rows.Length == 0) return;
+        var term = string.Join('|', rows.Select(row => ExactApi(row.Name, row.Module)));
         ApiSearch.Text = (ApiSearch.Text.Trim() + (hide ? " -" : " ") + term).Trim();
         if (!hide) SummaryCheck.IsChecked = false;
     }
 
     private void SummaryActivated(object sender, MouseButtonEventArgs e)
     {
-        if (e.OriginalSource is DependencyObject source &&
-            ItemsControl.ContainerFromElement(SummaryGrid, source) is DataGridRow) ShowSummaryApi(false);
+        if (e.ChangedButton == MouseButton.Left && e.OriginalSource is DependencyObject source &&
+            ItemsControl.ContainerFromElement(SummaryGrid, source) is DataGridRow)
+            FilterSummary(SelectedSummaryRows(), false);
     }
 
     private void SummaryKeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Enter) return;
         e.Handled = true;
-        ShowSummaryApi(false);
+        FilterSummary(SelectedSummaryRows(), false);
     }
 
     private static ContextMenu ToolbarMenu(FrameworkElement target) =>
@@ -507,8 +516,9 @@ public partial class MainWindow
 
     private void SummaryContextOpening(object sender, ContextMenuEventArgs e)
     {
-        ToolWindow.SelectContextRow(sender, e);
-        if (SummaryGrid.SelectedItem is not SummaryItem item)
+        if (e.CursorLeft >= 0) ToolWindow.SelectContextRow(sender, e);
+        var rows = SelectedSummaryRows();
+        if (rows.Length == 0)
         {
             e.Handled = true;
             return;
@@ -518,10 +528,12 @@ public partial class MainWindow
             row.TotalMs.ToString("F1", CultureInfo.InvariantCulture),
             row.AverageUs.ToString("F1", CultureInfo.InvariantCulture),
             row.LongestUs.ToString("F1", CultureInfo.InvariantCulture), row.Category);
-        AddMenuItem(menu, $"Show Only API: {item.Name}", () => ShowSummaryApi(false));
-        AddMenuItem(menu, $"Hide API: {item.Name}", () => ShowSummaryApi(true));
+        var target = rows.Length == 1 ? $"API: {rows[0].Name}" : $"{rows.Length:N0} APIs";
+        AddMenuItem(menu, $"Show Only {target}", () => FilterSummary(rows, false));
+        AddMenuItem(menu, $"Hide {target}", () => FilterSummary(rows, true));
         menu.Items.Add(new Separator());
-        AddMenuItem(menu, "Copy Row", () => Copy(Line(item)));
+        AddMenuItem(menu, rows.Length == 1 ? "Copy Row" : "Copy Selected Rows", () =>
+            Copy(string.Join('\n', rows.Select(Line))));
         AddMenuItem(menu, "Copy All Rows", () => Copy("Function\tCalls\tFailed\tTotal (ms)\tAverage (us)\tLongest (us)\tCategory\n" +
             string.Join('\n', SummaryGrid.Items.OfType<SummaryItem>().Select(Line))));
         SummaryGrid.ContextMenu = menu;
