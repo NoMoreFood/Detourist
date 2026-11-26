@@ -208,6 +208,10 @@ def snapshots(collector_path, target):
                     index=0, limit=10)['calls']
                 writer.execute(insert, (count + 3, (count + 3) * 10, (count + 3) * 10 + 2, 0))
                 writer.commit()
+
+                # Keep the test writer's checkpoint at 4 MiB across trace page sizes.
+                page_bytes = writer.execute('PRAGMA page_size').fetchone()[0]
+                writer.execute(f'PRAGMA wal_autocheckpoint={4 * 1024 * 1024 // page_bytes}')
                 assert writer.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
                 for turn in range(2500):
                     writer.execute('UPDATE calls SET result=? WHERE id=?', (turn, count + 3))

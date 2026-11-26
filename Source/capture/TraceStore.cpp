@@ -12,6 +12,8 @@ namespace Detourist
 {
 constexpr int TraceWriteBusyTimeoutMs = 1000;
 constexpr int TraceReadBusyTimeoutMs = 250;
+constexpr int CheckpointIntervalPages = 512;
+constexpr int ForegroundCheckpointPages = 4096;
 constexpr size_t MaxCachedEntryBytes = 8 * 1024 * 1024;
 constexpr size_t MaxCachedEntries = 4096;
 constexpr size_t MaxPendingTransactionOps = 16384;
@@ -57,7 +59,7 @@ TraceStore::TraceStore(const std::wstring& path)
         SqlCheck(sqlite3_file_control(database_, "main", SQLITE_FCNTL_CHUNK_SIZE, &pageBytes), database_);
         auto schema = "PRAGMA page_size=" + std::to_string(pageBytes) +
             "; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192;"
-            "PRAGMA wal_autocheckpoint=4096; PRAGMA application_id=" + std::to_string(TraceApplicationId) +
+            "PRAGMA application_id=" + std::to_string(TraceApplicationId) +
             "; PRAGMA user_version=" + std::to_string(TraceSchemaVersion) + ";"
             "CREATE TABLE session(frequency INTEGER, start_clock INTEGER, start_utc INTEGER, total_calls INTEGER);"
             "CREATE TABLE apis(target INTEGER, id INTEGER, module TEXT, name TEXT, parameters TEXT,"
@@ -124,9 +126,24 @@ TraceStore::TraceStore(const std::wstring& path)
             ") ELSE ?4 END, output=CASE WHEN (flags & " + std::to_string(AsyncCompleted) +
             ")!=0 THEN output ELSE ?5 END, adjusted_duration=?8 WHERE target=?6 AND id=?7";
         SqlCheck(sqlite3_prepare_v2(database_, leaveSql.c_str(), -1, &leave_, nullptr), database_);
+
+        // A second connection can copy committed WAL pages while the writer accepts the next batch.
+        result = sqlite3_open_v2(name.c_str(), &checkpointDatabase_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX,
+            nullptr);
+        SqlCheck(result, checkpointDatabase_);
+        SqlCheck(sqlite3_file_control(checkpointDatabase_, "main", SQLITE_FCNTL_CHUNK_SIZE, &pageBytes),
+            checkpointDatabase_);
+        SqlCheck(sqlite3_exec(checkpointDatabase_, "PRAGMA synchronous=NORMAL; SELECT 1 FROM sqlite_schema LIMIT 1",
+            nullptr, nullptr, nullptr), checkpointDatabase_);
+        sqlite3_wal_hook(database_, [](void* context, sqlite3*, const char*, int frames)
+        {
+            *static_cast<int*>(context) = frames;
+            return SQLITE_OK;
+        }, &walFrames_);
     }
     catch (...)
     {
+        sqlite3_close(checkpointDatabase_);
         sqlite3_finalize(enter_);
         sqlite3_finalize(leave_);
         sqlite3_close(database_);
@@ -136,6 +153,8 @@ TraceStore::TraceStore(const std::wstring& path)
 
 TraceStore::~TraceStore()
 {
+    if (checkpoint_.valid()) checkpoint_.wait();
+    sqlite3_close(checkpointDatabase_);
     sqlite3_finalize(enter_);
     sqlite3_finalize(leave_);
     if (database_) sqlite3_close(database_);
@@ -171,6 +190,12 @@ bool TraceStore::HasUnfinishedCalls(int64_t target)
     return statement.Next();
 }
 
+static void PassiveCheckpoint(sqlite3* database)
+{
+    auto result = sqlite3_wal_checkpoint_v2(database, "main", SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+    if (result != SQLITE_BUSY) SqlCheck(result, database);
+}
+
 void TraceStore::Flush()
 {
     // Publish unfinished calls on the same timer as completed calls, with a bounded staging budget.
@@ -180,11 +205,34 @@ void TraceStore::Flush()
         WriteEntry(entry->first.target, entry->second);
         RecycleEntry(entry);
     }
-    if (!pending_) return;
-    Statement totals(database_, "UPDATE session SET total_calls=?");
-    totals.Exec(count_);
-    Execute("COMMIT");
-    pending_ = 0;
+    if (pending_)
+    {
+        Statement totals(database_, "UPDATE session SET total_calls=?");
+        totals.Exec(count_);
+        Execute("COMMIT");
+        pending_ = 0;
+    }
+
+    // Space attempts by WAL growth so a reader holding an older snapshot cannot trigger work on every commit.
+    if (walFrames_ < lastCheckpointFrame_) lastCheckpointFrame_ = 0;
+    if (walFrames_ - lastCheckpointFrame_ < CheckpointIntervalPages) return;
+    // Let the writer catch up at 32 MiB when continuous commits prevent the WAL from restarting.
+    const bool catchUp = walFrames_ >= ForegroundCheckpointPages;
+    if (checkpoint_.valid())
+    {
+        if (!catchUp && checkpoint_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        checkpoint_.get();
+    }
+    lastCheckpointFrame_ = walFrames_;
+    if (catchUp) PassiveCheckpoint(database_);
+    else checkpoint_ = std::async(std::launch::async, PassiveCheckpoint, checkpointDatabase_);
+}
+
+void TraceStore::Finish()
+{
+    Flush();
+    if (checkpoint_.valid()) checkpoint_.get();
+    PassiveCheckpoint(database_);
 }
 
 int64_t TraceStore::AddTarget(uint32_t processId, const std::wstring& image, int64_t parent, uint64_t installedMask,

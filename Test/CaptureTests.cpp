@@ -1135,6 +1135,52 @@ void StorageFailures(const std::wstring& output)
     }
 }
 
+void CheckpointWithReader(const std::wstring& output)
+{
+    // Hold a snapshot while enough completed calls accumulate to require multiple checkpoints.
+    auto path = output + L"\\checkpoint-reader.db";
+    TraceStore store(path);
+    auto target = store.AddTarget(100, L"writer.exe", 0, AllApis);
+    sqlite3* raw = nullptr;
+    auto result = sqlite3_open_v2(Utf8(path).c_str(), &raw, SQLITE_OPEN_READWRITE, nullptr);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> reader(raw, sqlite3_close);
+    SqlCheck(result, raw);
+    Statement(raw, "BEGIN").Exec();
+    auto total = [&]
+    {
+        Statement query(raw, "SELECT total_calls FROM session");
+        Require(query.Next(), "Cannot read the checkpoint test session.");
+        return sqlite3_column_int64(query.value, 0);
+    };
+    Require(total() == 0, "The reader did not start with an empty snapshot.");
+    constexpr int calls = 1280;
+    Value value{1, ValueKind::Bytes, 0, 32768, 32768};
+    auto entry = EnterRecord(Api::WriteFile, 1);
+    entry.payload.resize(sizeof(value) + value.capturedBytes, std::byte{0x5a});
+    memcpy(entry.payload.data(), &value, sizeof(value));
+    auto leaving = EnterRecord(Api::WriteFile, 1);
+    leaving.event.kind = EventKind::Leave;
+    for (int id = 1; id <= calls; ++id)
+    {
+        entry.event.callId = leaving.event.callId = id;
+        store.Add(target, entry);
+        store.Add(target, leaving);
+        if (id % 32 == 0) store.Flush();
+    }
+
+    // Releasing the snapshot lets finish copy every committed frame before reporting capture completion.
+    Require(total() == 0, "A checkpoint changed the reader's snapshot.");
+    Statement(raw, "COMMIT").Exec();
+    store.Finish();
+    int frames = 0, copied = 0;
+    SqlCheck(sqlite3_wal_checkpoint_v2(raw, "main", SQLITE_CHECKPOINT_NOOP, &frames, &copied), raw);
+    Statement rows(raw, "SELECT count(*),sum(length(input)) FROM calls WHERE ended IS NOT NULL");
+    Require(total() == calls && frames > 0 && frames == copied && rows.Next() &&
+        sqlite3_column_int(rows.value, 0) == calls &&
+        sqlite3_column_int64(rows.value, 1) == static_cast<int64_t>(calls * entry.payload.size()),
+        "The finished capture did not checkpoint every completed call and its payload.");
+}
+
 void TraceSizeThreshold(const std::wstring& output)
 {
     Fixture fixture;
@@ -1269,6 +1315,7 @@ int wmain(int argc, wchar_t** argv)
             FrozenPage(output);
             CompleteViewCursor(output);
             StorageFailures(output);
+            CheckpointWithReader(output);
             TraceSizeThreshold(output);
             TransportPressure();
             TransportSuspendedProducer();

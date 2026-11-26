@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -199,6 +200,7 @@ public:
         uint64_t epoch = 0, bool loaded = true, const ModuleIdentity& identity = {});
     void Add(int64_t target, const RecordView& record);
     void Flush();
+    void Finish();
     bool HasDefinition(int64_t target, Api api) const;
     bool HasUnfinishedCalls(int64_t target);
     void Diagnostic(int64_t target, const std::wstring& message);
@@ -224,6 +226,9 @@ private:
     void Begin();
     void WriteEntry(int64_t target, const RecordView& entry, const RecordView* leaving = nullptr);
     sqlite3* database_ = nullptr;
+    sqlite3* checkpointDatabase_ = nullptr;
+    std::future<void> checkpoint_;
+    int walFrames_ = 0, lastCheckpointFrame_ = 0;
     sqlite3_stmt* enter_ = nullptr;
     sqlite3_stmt* leave_ = nullptr;
     uint32_t pending_ = 0;

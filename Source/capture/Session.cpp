@@ -1423,7 +1423,7 @@ void Session::Run(uint32_t attachPid, std::wstring executable, std::wstring argu
                 else Sleep(IdleWaitMs);
             }
         }
-        store_->Flush();
+        store_->Finish();
         std::wstring summary = traceLimitReached ? L"Capture reached the configured trace size threshold." :
             skippedChildren_ ?
             L"Partial capture finished: " + std::to_wstring(skippedChildren_) +
@@ -1449,7 +1449,7 @@ void Session::Run(uint32_t attachPid, std::wstring executable, std::wstring argu
         }
         try
         {
-            if (store_) { store_->Diagnostic(0, Wide(error.what())); store_->Flush(); }
+            if (store_) { store_->Diagnostic(0, Wide(error.what())); store_->Finish(); }
         }
         catch (...) {}
         PublishStatus(L"Capture stopped: " + Wide(error.what()));
