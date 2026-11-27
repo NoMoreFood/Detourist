@@ -6,10 +6,17 @@
 #include <algorithm>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+extern "C" __declspec(dllexport) volatile LONG64 DetouristStackImageEpoch = 1;
 
 namespace Detourist
 {
+void InvalidateStackImageCache() noexcept
+{
+    InterlockedIncrement64(&DetouristStackImageEpoch);
+}
+
 constexpr uint32_t MaxWalkDepth = MaximumStack * 3;
+constexpr size_t CachedStackImageCount = 32;
 #ifdef _WIN64
 constexpr size_t DynamicStackTableCapacity = 256;
 constexpr size_t CallbackStackFunctionCapacity = 512;
@@ -414,31 +421,84 @@ bool UnwindDynamicStack(CONTEXT& context)
     return unwound;
 }
 
+struct StackImage
+{
+    uint64_t base = 0;
+    uint32_t bytes = 0;
+    IMAGE_DATA_DIRECTORY functions{};
+    MEMORY_BASIC_INFORMATION region{};
+};
+struct ThreadStackCache
+{
+    LONG64 epoch = 0;
+    void* tibStackBase = nullptr;
+    MEMORY_BASIC_INFORMATION stack{};
+    StackImage images[CachedStackImageCount]{};
+    uint32_t nextImage = 0;
+};
+[[msvc::no_tls_guard]] constinit thread_local ThreadStackCache CachedStackState{};
+
 uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uint32_t limit, uint32_t& flags)
 {
-    struct StackImage
+    // Reuse validated image unwind directories and TEB stack bounds until memory protection or module state changes.
+    const auto currentEpoch = ActiveTransport ? ReadShared64(DetouristStackImageEpoch) : 0;
+    if (currentEpoch && CachedStackState.epoch != currentEpoch)
     {
-        uint64_t base = 0;
-        uint32_t bytes = 0;
-        IMAGE_DATA_DIRECTORY functions{};
-        MEMORY_BASIC_INFORMATION region{};
-    } images[StackImageCacheSize];
+        CachedStackState = {};
+        CachedStackState.epoch = currentEpoch;
+    }
+    StackImage images[StackImageCacheSize];
     uint32_t count = 0, nextImage = 0;
+    const auto& tib = NtCurrentTeb()->NtTib;
+    const bool tebStack = currentEpoch != 0 &&
+        context.Rsp >= reinterpret_cast<uint64_t>(tib.StackLimit) &&
+        context.Rsp < reinterpret_cast<uint64_t>(tib.StackBase);
     MEMORY_BASIC_INFORMATION stack{};
-    if (!VirtualQuery(reinterpret_cast<void*>(context.Rsp), &stack, sizeof(stack)) ||
-        stack.State != MEM_COMMIT || stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    if (tebStack && CachedStackState.tibStackBase == tib.StackBase &&
+        context.Rsp - reinterpret_cast<uint64_t>(CachedStackState.stack.BaseAddress) <
+            CachedStackState.stack.RegionSize)
+        stack = CachedStackState.stack;
+    else
+    {
+        if (!VirtualQuery(reinterpret_cast<void*>(context.Rsp), &stack, sizeof(stack)) ||
+            stack.State != MEM_COMMIT || stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+        if (tebStack)
+        {
+            CachedStackState.tibStackBase = tib.StackBase;
+            CachedStackState.stack = stack;
+        }
+    }
     const auto allocation = stack.AllocationBase;
     bool recording = !caller;
     __try
     {
         for (uint32_t depth = 0; context.Rip && depth < MaxWalkDepth; ++depth)
         {
-            // Reuse visited image regions within this walk without retaining mappings across application calls.
-            auto cached = std::find_if(std::begin(images), std::end(images), [&](const auto& entry)
-            { return context.Rip - reinterpret_cast<uint64_t>(entry.region.BaseAddress) < entry.region.RegionSize; });
-            if (cached == std::end(images)) cached = &images[nextImage++ % std::size(images)];
-            if (!ReadStackImage(context.Rip, cached->base, cached->bytes, cached->functions, cached->region))
-            { flags |= Truncated; break; }
+            StackImage* cached = nullptr;
+            if (currentEpoch)
+            {
+                auto hit = std::find_if(std::begin(CachedStackState.images), std::end(CachedStackState.images),
+                    [&](const auto& entry)
+                {
+                    return entry.base && context.Rip - entry.base < entry.bytes &&
+                        context.Rip - reinterpret_cast<uint64_t>(entry.region.BaseAddress) < entry.region.RegionSize;
+                });
+                if (hit != std::end(CachedStackState.images)) cached = hit;
+            }
+            if (!cached)
+            {
+                auto local = std::find_if(std::begin(images), std::end(images), [&](const auto& entry)
+                {
+                    return context.Rip - reinterpret_cast<uint64_t>(entry.region.BaseAddress) <
+                        entry.region.RegionSize;
+                });
+                cached = local != std::end(images) ? local : &images[nextImage++ % std::size(images)];
+                if (!ReadStackImage(context.Rip, cached->base, cached->bytes, cached->functions, cached->region))
+                { flags |= Truncated; break; }
+                if (currentEpoch && cached->base)
+                    CachedStackState.images[CachedStackState.nextImage++ % std::size(CachedStackState.images)] =
+                        *cached;
+            }
             const auto image = cached->base;
             const auto& functions = cached->functions;
             recording |= context.Rip == caller;
@@ -471,10 +531,17 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
                     &handler, &establisher, nullptr);
             }
             if (!context.Rip) break;
-            if (context.Rsp <= previous ||
-                (context.Rsp - reinterpret_cast<uint64_t>(stack.BaseAddress) >= stack.RegionSize &&
-                !VirtualQuery(reinterpret_cast<void*>(context.Rsp), &stack, sizeof(stack))) ||
-                stack.State != MEM_COMMIT || stack.AllocationBase != allocation ||
+            if (context.Rsp <= previous) { flags |= Truncated; break; }
+            if (context.Rsp - reinterpret_cast<uint64_t>(stack.BaseAddress) >= stack.RegionSize)
+            {
+                if (!VirtualQuery(reinterpret_cast<void*>(context.Rsp), &stack, sizeof(stack)))
+                { flags |= Truncated; break; }
+                if (tebStack && stack.State == MEM_COMMIT && stack.AllocationBase == allocation &&
+                    !(stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                    context.Rsp < reinterpret_cast<uint64_t>(tib.StackBase))
+                    CachedStackState.stack = stack;
+            }
+            if (stack.State != MEM_COMMIT || stack.AllocationBase != allocation ||
                 stack.Protect & (PAGE_GUARD | PAGE_NOACCESS))
             { flags |= Truncated; break; }
             if (depth + 1 == MaxWalkDepth) flags |= Truncated;
@@ -485,16 +552,48 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
 }
 
 #else
+struct ThreadStackCache
+{
+    LONG64 epoch = 0;
+    void* tibStackBase = nullptr;
+    MEMORY_BASIC_INFORMATION stack{};
+    MEMORY_BASIC_INFORMATION images[CachedStackImageCount]{};
+    uint32_t nextImage = 0;
+};
+[[msvc::no_tls_guard]] constinit thread_local ThreadStackCache CachedStackState{};
+
 void AddStackHooks(std::vector<HookDefinition>&) {}
 bool IsStackHook(void*) { return false; }
 
 uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uint32_t limit, uint32_t& flags)
 {
+    const auto currentEpoch = ActiveTransport ? ReadShared64(DetouristStackImageEpoch) : 0;
+    if (currentEpoch && CachedStackState.epoch != currentEpoch)
+    {
+        CachedStackState = {};
+        CachedStackState.epoch = currentEpoch;
+    }
     uint32_t count = 0;
     auto frame = uintptr_t{context.Ebp};
+    const auto& tib = NtCurrentTeb()->NtTib;
+    const auto esp = uintptr_t{context.Esp};
+    const bool tebStack = currentEpoch != 0 &&
+        esp >= reinterpret_cast<uintptr_t>(tib.StackLimit) &&
+        esp < reinterpret_cast<uintptr_t>(tib.StackBase);
     MEMORY_BASIC_INFORMATION stack{};
-    if (!VirtualQuery(reinterpret_cast<void*>(context.Esp), &stack, sizeof(stack)) ||
-        stack.State != MEM_COMMIT || stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    if (tebStack && CachedStackState.tibStackBase == tib.StackBase &&
+        esp - reinterpret_cast<uintptr_t>(CachedStackState.stack.BaseAddress) < CachedStackState.stack.RegionSize)
+        stack = CachedStackState.stack;
+    else
+    {
+        if (!VirtualQuery(reinterpret_cast<void*>(esp), &stack, sizeof(stack)) ||
+            stack.State != MEM_COMMIT || stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+        if (tebStack)
+        {
+            CachedStackState.tibStackBase = tib.StackBase;
+            CachedStackState.stack = stack;
+        }
+    }
     const auto allocation = stack.AllocationBase;
     bool recording = !caller;
     auto pc = uintptr_t{context.Eip};
@@ -503,10 +602,29 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
     // Frame-pointer chains stop at omitted frames, other stack allocations and unreadable memory.
     for (uint32_t depth = 0; pc && depth < MaxWalkDepth; ++depth)
     {
-        if ((pc - reinterpret_cast<uintptr_t>(code.BaseAddress) >= code.RegionSize &&
-            !VirtualQuery(reinterpret_cast<void*>(pc), &code, sizeof(code))) || code.State != MEM_COMMIT ||
-            code.Protect & (PAGE_GUARD | PAGE_NOACCESS) || !(code.Protect &
-                (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) break;
+        if (pc - reinterpret_cast<uintptr_t>(code.BaseAddress) >= code.RegionSize)
+        {
+            const MEMORY_BASIC_INFORMATION* hit = nullptr;
+            if (currentEpoch)
+            {
+                auto found = std::find_if(std::begin(CachedStackState.images), std::end(CachedStackState.images),
+                    [&](const auto& entry)
+                {
+                    return entry.Type == MEM_IMAGE &&
+                        pc - reinterpret_cast<uintptr_t>(entry.BaseAddress) < entry.RegionSize;
+                });
+                if (found != std::end(CachedStackState.images)) hit = found;
+            }
+            if (hit) code = *hit;
+            else
+            {
+                if (!VirtualQuery(reinterpret_cast<void*>(pc), &code, sizeof(code)) || code.State != MEM_COMMIT ||
+                    code.Protect & (PAGE_GUARD | PAGE_NOACCESS) || !(code.Protect &
+                        (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) break;
+                if (currentEpoch && code.Type == MEM_IMAGE)
+                    CachedStackState.images[CachedStackState.nextImage++ % std::size(CachedStackState.images)] = code;
+            }
+        }
         recording |= pc == caller;
         if (recording)
         {
@@ -514,12 +632,18 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
             frames[count++] = pc;
         }
         if (code.Type != MEM_IMAGE) break;
-        if (frame < context.Esp || frame % sizeof(uintptr_t) ||
-            (frame - reinterpret_cast<uintptr_t>(stack.BaseAddress) >= stack.RegionSize &&
-            !VirtualQuery(reinterpret_cast<void*>(frame), &stack, sizeof(stack))) || stack.State != MEM_COMMIT ||
-            stack.AllocationBase != allocation || stack.Protect & (PAGE_GUARD | PAGE_NOACCESS) ||
-            stack.RegionSize < sizeof(uintptr_t) * 2 || frame - reinterpret_cast<uintptr_t>(stack.BaseAddress) >
-                stack.RegionSize - sizeof(uintptr_t) * 2) break;
+        if (frame < context.Esp || frame % sizeof(uintptr_t)) break;
+        if (frame - reinterpret_cast<uintptr_t>(stack.BaseAddress) >= stack.RegionSize)
+        {
+            if (!VirtualQuery(reinterpret_cast<void*>(frame), &stack, sizeof(stack))) break;
+            if (tebStack && stack.State == MEM_COMMIT && stack.AllocationBase == allocation &&
+                !(stack.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                frame < reinterpret_cast<uintptr_t>(tib.StackBase))
+                CachedStackState.stack = stack;
+        }
+        if (stack.State != MEM_COMMIT || stack.AllocationBase != allocation ||
+            stack.Protect & (PAGE_GUARD | PAGE_NOACCESS) || stack.RegionSize < sizeof(uintptr_t) * 2 ||
+            frame - reinterpret_cast<uintptr_t>(stack.BaseAddress) > stack.RegionSize - sizeof(uintptr_t) * 2) break;
         uintptr_t next[2]{};
         if (!ReadCaptureMemory(reinterpret_cast<void*>(frame), next, sizeof(next)) || next[0] <= frame) break;
         context.Esp = static_cast<DWORD>(frame + sizeof(next));

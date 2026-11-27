@@ -5,15 +5,66 @@ namespace Detourist
 {
 RuntimeExport** PlanCache = nullptr;
 RuntimeInterface** InterfaceCache = nullptr;
+uint32_t* InterfaceNameSlots = nullptr;
+uint32_t* InterfaceRttiSlots = nullptr;
+uint32_t InterfaceSlotCapacity = 0;
+
+uint32_t HashCatalogText(const char* text)
+{
+    uint32_t hash = Fnv1aOffsetBasis32;
+    while (*text) hash = (hash ^ static_cast<uint8_t>(*text++)) * Fnv1aPrime32;
+    return hash;
+}
 
 void InitializeCaptureCatalog()
 {
-    auto header = InstructionTransport.catalog.Header();
+    auto& catalog = InstructionTransport.catalog;
+    auto header = catalog.Header();
     PlanCache = static_cast<RuntimeExport**>(dr_global_alloc(header->planCount * sizeof(RuntimeExport*)));
     InterfaceCache =
         static_cast<RuntimeInterface**>(dr_global_alloc(header->interfaceCount * sizeof(RuntimeInterface*)));
     memset(PlanCache, 0, header->planCount * sizeof(RuntimeExport*));
     memset(InterfaceCache, 0, header->interfaceCount * sizeof(RuntimeInterface*));
+
+    // Index interface labels and closed WinRT RTTI spellings once to avoid per-image linear catalog scans.
+    InterfaceSlotCapacity = 64;
+    while (InterfaceSlotCapacity < header->interfaceCount * 2ull) InterfaceSlotCapacity *= 2;
+    const auto slotBytes = InterfaceSlotCapacity * sizeof(uint32_t);
+    InterfaceNameSlots = static_cast<uint32_t*>(dr_global_alloc(slotBytes));
+    InterfaceRttiSlots = static_cast<uint32_t*>(dr_global_alloc(slotBytes));
+    memset(InterfaceNameSlots, 0, slotBytes);
+    memset(InterfaceRttiSlots, 0, slotBytes);
+    const auto mask = InterfaceSlotCapacity - 1;
+    const auto* interfaces = catalog.Interfaces();
+    for (uint32_t entry = 0; entry < header->interfaceCount; ++entry)
+    {
+        const auto& contract = interfaces[entry];
+        if (auto label = catalog.Text(contract.name); label && *label)
+        {
+            for (uint32_t slot = HashCatalogText(label) & mask;; slot = (slot + 1) & mask)
+            {
+                auto current = InterfaceNameSlots[slot];
+                if (!current) { InterfaceNameSlots[slot] = entry + 1; break; }
+                const auto& existing = interfaces[current - 1];
+                auto existingLabel = catalog.Text(existing.name);
+                if (existingLabel && !strcmp(existingLabel, label))
+                {
+                    if (contract.slotCount > existing.slotCount) InterfaceNameSlots[slot] = entry + 1;
+                    break;
+                }
+            }
+        }
+        if (auto rtti = contract.rttiName ? catalog.Text(contract.rttiName) : nullptr; rtti && *rtti)
+        {
+            for (uint32_t slot = HashCatalogText(rtti) & mask;; slot = (slot + 1) & mask)
+            {
+                auto current = InterfaceRttiSlots[slot];
+                if (!current) { InterfaceRttiSlots[slot] = entry + 1; break; }
+                auto existingRtti = catalog.Text(interfaces[current - 1].rttiName);
+                if (existingRtti && !strcmp(existingRtti, rtti)) break;
+            }
+        }
+    }
 }
 
 const RuntimeExport* CapturePlan(uint32_t index)
@@ -150,6 +201,38 @@ const GUID* RuntimeInterfaceIdentity(uint16_t index)
     return index && index <= catalog.Header()->interfaceCount ? &catalog.Interfaces()[index - 1].iid : nullptr;
 }
 
+const CatalogInterface* CatalogInterfaceByName(const char* name)
+{
+    if (!name || !*name || !InterfaceNameSlots) return nullptr;
+    auto& catalog = InstructionTransport.catalog;
+    const auto* interfaces = catalog.Interfaces();
+    const auto mask = InterfaceSlotCapacity - 1;
+    for (uint32_t slot = HashCatalogText(name) & mask;; slot = (slot + 1) & mask)
+    {
+        auto entry = InterfaceNameSlots[slot];
+        if (!entry) return nullptr;
+        const auto& contract = interfaces[entry - 1];
+        auto label = catalog.Text(contract.name);
+        if (label && !strcmp(label, name)) return &contract;
+    }
+}
+
+const CatalogInterface* CatalogInterfaceByRtti(const char* decorated)
+{
+    if (!decorated || !*decorated || !InterfaceRttiSlots) return nullptr;
+    auto& catalog = InstructionTransport.catalog;
+    const auto* interfaces = catalog.Interfaces();
+    const auto mask = InterfaceSlotCapacity - 1;
+    for (uint32_t slot = HashCatalogText(decorated) & mask;; slot = (slot + 1) & mask)
+    {
+        auto entry = InterfaceRttiSlots[slot];
+        if (!entry) return nullptr;
+        const auto& contract = interfaces[entry - 1];
+        auto spelling = contract.rttiName ? catalog.Text(contract.rttiName) : nullptr;
+        if (spelling && !strcmp(spelling, decorated)) return &contract;
+    }
+}
+
 void FreeCaptureCatalog()
 {
     auto header = InstructionTransport.catalog.Header();
@@ -159,7 +242,12 @@ void FreeCaptureCatalog()
         if (InterfaceCache[index]) dr_global_free(InterfaceCache[index], sizeof(RuntimeInterface));
     dr_global_free(PlanCache, header->planCount * sizeof(RuntimeExport*));
     dr_global_free(InterfaceCache, header->interfaceCount * sizeof(RuntimeInterface*));
+    if (InterfaceNameSlots) dr_global_free(InterfaceNameSlots, InterfaceSlotCapacity * sizeof(uint32_t));
+    if (InterfaceRttiSlots) dr_global_free(InterfaceRttiSlots, InterfaceSlotCapacity * sizeof(uint32_t));
     PlanCache = nullptr;
     InterfaceCache = nullptr;
+    InterfaceNameSlots = nullptr;
+    InterfaceRttiSlots = nullptr;
+    InterfaceSlotCapacity = 0;
 }
 }

@@ -223,10 +223,18 @@ private:
             return static_cast<size_t>(key.id ^ (static_cast<uint64_t>(key.target) << 48));
         }
     };
+    struct SnapshotBuffer
+    {
+        std::string_view header, data;
+        uint64_t hash = 0;
+        auto Key() const { return std::tuple{data.size(), hash, data, header}; }
+    };
+    static bool NextBuffer(std::string_view& remaining, SnapshotBuffer& buffer);
+    static void PackReturn(sqlite3_context* context, int count, sqlite3_value** values);
     void Execute(const char* sql);
     void Begin();
     void WriteEntry(int64_t target, const RecordView& entry, const RecordView* leaving = nullptr);
-    void BindInputBlocks(std::span<const std::byte> input);
+    bool BindInputBlocks(std::span<const std::byte> input);
     sqlite3_int64 InputBlockId(const std::byte* data);
     void FlushInputBlocks();
     sqlite3* database_ = nullptr;
@@ -236,6 +244,12 @@ private:
     sqlite3_stmt* enter_ = nullptr;
     sqlite3_stmt* leave_ = nullptr;
     sqlite3_stmt* insertBlock_ = nullptr;
+    sqlite3_stmt* insertApi_ = nullptr;
+    sqlite3_stmt* insertThread_ = nullptr;
+    sqlite3_stmt* updateTotals_ = nullptr;
+    std::vector<SnapshotBuffer> packBuffers_;
+    std::vector<std::pair<int, int>> packRanges_;
+    std::string packedReturn_;
     static constexpr size_t InputBlockBytes = 64;
     static constexpr sqlite3_int64 BlocksPerPage = 8192 / InputBlockBytes;
     struct InputBlock

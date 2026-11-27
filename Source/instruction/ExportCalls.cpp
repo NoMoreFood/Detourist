@@ -66,7 +66,7 @@ InstructionFrame* TakeExportFrame(void* context, InstructionThread& thread)
 void ReleaseExportFrame(InstructionThread& thread, InstructionFrame& frame)
 {
     if (frame.observerSet && thread.current == &frame)
-        SetInstructionObserver(dr_get_current_drcontext(), frame.previousObserver);
+        SetInstructionObserver(dr_get_current_drcontext(), thread, frame.previousObserver);
     auto link = &thread.current;
     while (*link && *link != &frame) link = &(*link)->previous;
     if (*link) *link = frame.previous;
@@ -109,8 +109,10 @@ void ExportEntered(void* wrapped, void** state)
         thread->comCaller = 0;
     }
     ObserverContext observer{};
-    if (InstructionObserver(context, caller, &observer)) return;
-    CaptureObservation capture(observer.clock ? observer.clock : &thread->clock, Clock());
+    if (InstructionObserver(context, thread, caller, &observer)) return;
+    auto selectedClock = observer.clock ? observer.clock : &thread->clock;
+    const bool nestedClock = selectedClock->depth != 0 || observer.parentId != 0 || thread->current != nullptr;
+    CaptureObservation capture(nestedClock ? selectedClock : nullptr, nestedClock ? Clock() : 0);
     if (InterlockedCompareExchange(&definition->sharedExport, 0, 0))
         definition = ResolveInstructionImport(definition, caller);
     definition = ResolveInterfaceDefinition(definition, receiver, slot);
@@ -151,6 +153,11 @@ void ExportEntered(void* wrapped, void** state)
     bool serialization = !native && RpcSerializationApi(definition->typed);
     if (!record && !discover && !breaks && !child && !extension && !mruLifetime && !asyncObserver &&
         !serialization && !definition->callbackRegistration && !moduleInitialization) return;
+    if (!capture.clock)
+    {
+        capture.clock = selectedClock;
+        capture.Resume(Clock());
+    }
     if (definition->signature.floatingArguments)
         machine = drwrap_get_mcontext_ex(wrapped,
             static_cast<dr_mcontext_flags_t>(DR_MC_CONTROL | DR_MC_INTEGER | DR_MC_MULTIMEDIA));
@@ -296,8 +303,8 @@ void ExportEntered(void* wrapped, void** state)
     if (record || queryRecord) CaptureInstructionStack(context, *frame, *machine, true);
     if (record)
     {
-        SetInstructionObserver(context, {header->captureIdentity, frame->event.callId, frame->event.depth + 1, 0,
-            static_cast<uint32_t>(definition->id)});
+        SetInstructionObserver(context, *thread, {header->captureIdentity, frame->event.callId, frame->event.depth + 1,
+            0, static_cast<uint32_t>(definition->id)});
         frame->observerSet = true;
     }
     if ((record || breaks) && IsDynamicApi(definition->id) && !definition->published)

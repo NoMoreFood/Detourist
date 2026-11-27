@@ -493,6 +493,7 @@ DWORD WINAPI AgentWorker(void*)
         ResetMruCapture(header->captureIdentity);
         transport->Header()->managedState = InterlockedCompareExchange(&ManagedProfilerState, 0, 0);
         BindModuleHistory(header);
+        InvalidateStackImageCache();
         ActiveTransport = transport;
         ReleaseSRWLockExclusive(&CaptureLock);
         EnableModuleRefresh();
@@ -514,6 +515,7 @@ DWORD WINAPI AgentWorker(void*)
     BindModuleHistory(nullptr);
     AcquireSRWLockExclusive(&CaptureLock);
     ActiveTransport = nullptr;
+    InvalidateStackImageCache();
     ReleaseSRWLockExclusive(&CaptureLock);
     ResetMruCapture(0);
 
@@ -651,6 +653,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI DetouristStartInstructions(void* p
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
 {
+    if (reason == DLL_THREAD_DETACH) Detourist::DetachObserverThread();
     if (reason == DLL_PROCESS_DETACH) InterlockedExchange(&Detourist::ProcessShuttingDown, 1);
     if (reason == DLL_PROCESS_ATTACH)
     {

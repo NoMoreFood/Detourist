@@ -10,6 +10,6 @@ uintptr_t LoadCaptureAgent(HANDLE process, DWORD pid, const std::wstring& path, 
     HANDLE startupToken);
 
 void StartInstructionEngine(DWORD pid, uint64_t mapping, SharedHeader& header, bool launched,
-    HANDLE startupToken);
+    HANDLE startupToken, uintptr_t agentBase = 0);
 void StopInstructionEngine(DWORD pid, SharedHeader& header);
 }

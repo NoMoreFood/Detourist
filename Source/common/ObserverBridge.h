@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 namespace Detourist
@@ -15,5 +16,18 @@ struct ObserverContext
     uint32_t flags;
     uint32_t api = UINT32_MAX;
     CaptureClock* clock = nullptr;
+};
+struct ObserverThreadPointers
+{
+    std::atomic<uint64_t>* slotGeneration = nullptr;
+    uint64_t expectedGeneration = 0;
+    uint64_t* captureIdentity = nullptr;
+    uint64_t* parentId = nullptr;
+    uint32_t* depth = nullptr;
+    uint32_t* api = nullptr;
+    bool* active = nullptr;
+    bool* followingChild = nullptr;
+    CaptureClock* clock = nullptr;
+    volatile LONG* processShuttingDown = nullptr;
 };
 }

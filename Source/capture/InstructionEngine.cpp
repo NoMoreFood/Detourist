@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <memory>
 
@@ -66,8 +67,126 @@ std::vector<BYTE> WindowSyscallStackBytes()
     return {base + tableRva, base + tableRva + limit};
 }
 
+const std::string& SystemSyscallTable()
+{
+    static const std::string cached = []
+    {
+        using Library = std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)>;
+
+        // Resolve system call numbers once from this machine's clean exports instead of rescanning on every launch.
+        struct Number
+        {
+            std::string name;
+            DWORD service;
+            bool window;
+        };
+        std::vector<Number> numbers;
+        for (const auto library : {L"ntdll.dll", L"win32u.dll"})
+        {
+            Library module(LoadLibraryExW(library, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), &FreeLibrary);
+            if (!module) continue;
+            const auto loaded = reinterpret_cast<const std::byte*>(module.get());
+            const auto loadedDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(loaded);
+            const auto loadedNt = reinterpret_cast<const IMAGE_NT_HEADERS*>(loaded + loadedDos->e_lfanew);
+
+            // Prefer the installed image when it matches the loaded build, bypassing in-process inline hooks.
+            wchar_t path[ExtendedPathCapacity]{};
+            auto length = GetModuleFileNameW(module.get(), path, static_cast<DWORD>(std::size(path)));
+            Handle imageFile(length && length < std::size(path) ? CreateFileW(path, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr) : INVALID_HANDLE_VALUE);
+            Handle imageMapping(imageFile ? CreateFileMappingW(imageFile.get(), nullptr,
+                PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr) : nullptr);
+            std::unique_ptr<const std::byte, decltype(&UnmapViewOfFile)> image(imageMapping ?
+                static_cast<const std::byte*>(MapViewOfFile(imageMapping.get(), FILE_MAP_READ, 0, 0, 0)) :
+                    nullptr, &UnmapViewOfFile);
+            const auto mappedDos = image ? reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get()) : nullptr;
+            const auto mappedNt = mappedDos && mappedDos->e_magic == IMAGE_DOS_SIGNATURE && mappedDos->e_lfanew > 0 ?
+                reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get() + mappedDos->e_lfanew) : nullptr;
+            const auto base = mappedNt && mappedNt->Signature == IMAGE_NT_SIGNATURE &&
+                mappedNt->FileHeader.TimeDateStamp == loadedNt->FileHeader.TimeDateStamp &&
+                mappedNt->OptionalHeader.SizeOfImage == loadedNt->OptionalHeader.SizeOfImage ? image.get() : loaded;
+            const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            const auto directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (!directory.VirtualAddress || directory.VirtualAddress + directory.Size >
+                nt->OptionalHeader.SizeOfImage) continue;
+            const auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + directory.VirtualAddress);
+            const auto names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+            const auto ordinals = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+            const auto functions = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
+
+            // Keep each signature search inside its export instead of borrowing a following service's code.
+            std::vector<DWORD> starts;
+            starts.reserve(exports->NumberOfFunctions);
+            for (DWORD index = 0; index < exports->NumberOfFunctions; ++index)
+            {
+                auto address = functions[index];
+                if (address < nt->OptionalHeader.SizeOfImage &&
+                    !(address >= directory.VirtualAddress && address < directory.VirtualAddress + directory.Size))
+                    starts.push_back(address);
+            }
+            std::sort(starts.begin(), starts.end());
+            starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+            for (DWORD index = 0; index < exports->NumberOfNames; ++index)
+            {
+                auto name = reinterpret_cast<const char*>(base + names[index]);
+                if (name[0] != 'N' || name[1] != 't') continue;
+                if (ordinals[index] >= exports->NumberOfFunctions) continue;
+                auto address = functions[ordinals[index]];
+                if (address >= directory.VirtualAddress && address < directory.VirtualAddress + directory.Size ||
+                    address >= nt->OptionalHeader.SizeOfImage) continue;
+                auto following = std::upper_bound(starts.begin(), starts.end(), address);
+                auto available = (following == starts.end() ? nt->OptionalHeader.SizeOfImage : *following) - address;
+                auto limit = std::min<DWORD>(32, available);
+                auto code = reinterpret_cast<const BYTE*>(base + address);
+                for (uint32_t offset = 0; offset + 7 < limit; ++offset)
+                {
+                    if (code[offset] != 0xB8) continue;
+                    DWORD number = 0;
+                    memcpy(&number, code + offset + 1, sizeof(number));
+                    bool syscall = false;
+                    for (uint32_t next = offset + 5; next + 1 < limit; ++next)
+                        if ((code[next] == 0x0F &&
+                                (code[next + 1] == 0x05 || sizeof(void*) == 4 && code[next + 1] == 0x34)) ||
+                            sizeof(void*) == 4 &&
+                                (code[next] == 0xFF && (code[next + 1] == 0xD2 || code[next + 1] == 0x12) ||
+                                    next + 6 < limit && code[next] == 0x64 && code[next + 1] == 0xFF &&
+                                        code[next + 2] == 0x15))
+                        {
+                            syscall = true;
+                            break;
+                        }
+                    if (syscall && (sizeof(void*) == 4 ? number & 0xFFFF : number) < 8192)
+                        numbers.push_back({name, number, !wcscmp(library, L"win32u.dll")});
+                    break;
+                }
+            }
+        }
+        auto discriminator = std::find_if(numbers.begin(), numbers.end(), [](const auto& value)
+        {
+            return value.name == "NtGetContextThread";
+        });
+        if (discriminator == numbers.end()) throw std::runtime_error("Cannot resolve this system's syscall numbers.");
+        std::ostringstream text;
+        text << "DrSyscall Number File\n1\nNtGetContextThread\nSTART=0x" << std::hex << discriminator->service << "\n";
+        auto stackBytes = sizeof(void*) == 8 ? WindowSyscallStackBytes() : std::vector<BYTE>{};
+        for (const auto& entry : numbers)
+        {
+            text << entry.name << "=0x" << entry.service;
+            auto index = entry.service - 0x1000;
+            if (entry.window && index < stackBytes.size() && stackBytes[index] % 4 == 0 &&
+                stackBytes[index] <= (MaximumArguments - 4) * 4)
+                text << "|stack=" << std::dec << static_cast<unsigned>(stackBytes[index]) << std::hex;
+            text << "\n";
+        }
+        text << "=END\n";
+        return text.str();
+    }();
+    return cached;
+}
+
 void StartInstructionEngine(DWORD pid, uint64_t mapping, SharedHeader& header, bool launched,
-    HANDLE startupToken)
+    HANDLE startupToken, uintptr_t agentBase)
 {
     const auto root = ModuleDirectory() + L"\\instruction";
     auto configuration =
@@ -85,117 +204,13 @@ void StartInstructionEngine(DWORD pid, uint64_t mapping, SharedHeader& header, b
     if (!registerProcess || !unregisterProcess || !registerClient)
         throw std::runtime_error("The instruction engine could not be loaded.");
 
-    // Resolve system call numbers from this machine's clean exports instead of using OS-version assumptions.
-    struct Number
-    {
-        std::string name;
-        DWORD service;
-        bool window;
-    };
-    std::vector<Number> numbers;
-    for (const auto library : {L"ntdll.dll", L"win32u.dll"})
-    {
-        Library module(LoadLibraryExW(library, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), &FreeLibrary);
-        if (!module) continue;
-        const auto loaded = reinterpret_cast<const std::byte*>(module.get());
-        const auto loadedDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(loaded);
-        const auto loadedNt = reinterpret_cast<const IMAGE_NT_HEADERS*>(loaded + loadedDos->e_lfanew);
-
-        // Prefer the installed image when it matches the loaded build, bypassing in-process inline hooks.
-        wchar_t path[ExtendedPathCapacity]{};
-        auto length = GetModuleFileNameW(module.get(), path, static_cast<DWORD>(std::size(path)));
-        Handle imageFile(length && length < std::size(path) ? CreateFileW(path, GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr) : INVALID_HANDLE_VALUE);
-        Handle imageMapping(imageFile ? CreateFileMappingW(imageFile.get(), nullptr,
-            PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr) : nullptr);
-        std::unique_ptr<const std::byte, decltype(&UnmapViewOfFile)> image(
-            imageMapping ? static_cast<const std::byte*>(MapViewOfFile(imageMapping.get(), FILE_MAP_READ, 0, 0, 0)) :
-                nullptr, &UnmapViewOfFile);
-        const auto mappedDos = image ? reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get()) : nullptr;
-        const auto mappedNt = mappedDos && mappedDos->e_magic == IMAGE_DOS_SIGNATURE && mappedDos->e_lfanew > 0 ?
-            reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get() + mappedDos->e_lfanew) : nullptr;
-        const auto base = mappedNt && mappedNt->Signature == IMAGE_NT_SIGNATURE &&
-            mappedNt->FileHeader.TimeDateStamp == loadedNt->FileHeader.TimeDateStamp &&
-            mappedNt->OptionalHeader.SizeOfImage == loadedNt->OptionalHeader.SizeOfImage ? image.get() : loaded;
-        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        const auto directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (!directory.VirtualAddress || directory.VirtualAddress + directory.Size >
-            nt->OptionalHeader.SizeOfImage) continue;
-        const auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + directory.VirtualAddress);
-        const auto names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
-        const auto ordinals = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
-        const auto functions = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
-
-        // Keep each signature search inside its export instead of borrowing a following service's code.
-        std::vector<DWORD> starts;
-        starts.reserve(exports->NumberOfFunctions);
-        for (DWORD index = 0; index < exports->NumberOfFunctions; ++index)
-        {
-            auto address = functions[index];
-            if (address < nt->OptionalHeader.SizeOfImage &&
-                !(address >= directory.VirtualAddress && address < directory.VirtualAddress + directory.Size))
-                starts.push_back(address);
-        }
-        std::sort(starts.begin(), starts.end());
-        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-        for (DWORD index = 0; index < exports->NumberOfNames; ++index)
-        {
-            auto name = reinterpret_cast<const char*>(base + names[index]);
-            if (name[0] != 'N' || name[1] != 't') continue;
-            if (ordinals[index] >= exports->NumberOfFunctions) continue;
-            auto address = functions[ordinals[index]];
-            if (address >= directory.VirtualAddress && address < directory.VirtualAddress + directory.Size ||
-                address >= nt->OptionalHeader.SizeOfImage) continue;
-            auto following = std::upper_bound(starts.begin(), starts.end(), address);
-            auto available = (following == starts.end() ? nt->OptionalHeader.SizeOfImage : *following) - address;
-            auto limit = std::min<DWORD>(32, available);
-            auto code = reinterpret_cast<const BYTE*>(base + address);
-            for (uint32_t offset = 0; offset + 7 < limit; ++offset)
-            {
-                if (code[offset] != 0xB8) continue;
-                DWORD number = 0;
-                memcpy(&number, code + offset + 1, sizeof(number));
-                bool syscall = false;
-                for (uint32_t next = offset + 5; next + 1 < limit; ++next)
-                    if ((code[next] == 0x0F &&
-                            (code[next + 1] == 0x05 || sizeof(void*) == 4 && code[next + 1] == 0x34)) ||
-                        sizeof(void*) == 4 &&
-                            (code[next] == 0xFF && (code[next + 1] == 0xD2 || code[next + 1] == 0x12) ||
-                                next + 6 < limit && code[next] == 0x64 && code[next + 1] == 0xFF &&
-                                    code[next + 2] == 0x15))
-                    {
-                        syscall = true;
-                        break;
-                    }
-                if (syscall && (sizeof(void*) == 4 ? number & 0xFFFF : number) < 8192)
-                    numbers.push_back({name, number, !wcscmp(library, L"win32u.dll")});
-                break;
-            }
-        }
-    }
-    auto discriminator = std::find_if(numbers.begin(), numbers.end(), [](const auto& value)
-    {
-        return value.name == "NtGetContextThread";
-    });
-    if (discriminator == numbers.end()) throw std::runtime_error("Cannot resolve this system's syscall numbers.");
+    const auto& tableText = SystemSyscallTable();
     wchar_t temporary[MAX_PATH];
     Check(GetTempPathW(MAX_PATH, temporary) != 0, "Locate syscall metadata cache");
     auto suffix = std::to_wstring(pid) + L"." + std::to_wstring(header.captureIdentity);
     auto numberPath = std::wstring(temporary) + L"Detourist.Syscalls." + suffix + L".txt";
-    std::ofstream file{std::filesystem::path(numberPath)};
-    file << "DrSyscall Number File\n1\nNtGetContextThread\nSTART=0x" << std::hex << discriminator->service << "\n";
-    auto stackBytes = sizeof(void*) == 8 ? WindowSyscallStackBytes() : std::vector<BYTE>{};
-    for (const auto& entry : numbers)
-    {
-        file << entry.name << "=0x" << entry.service;
-        auto index = entry.service - 0x1000;
-        if (entry.window && index < stackBytes.size() && stackBytes[index] % 4 == 0 &&
-            stackBytes[index] <= (MaximumArguments - 4) * 4)
-            file << "|stack=" << std::dec << static_cast<unsigned>(stackBytes[index]) << std::hex;
-        file << "\n";
-    }
-    file << "=END\n";
+    std::ofstream file{std::filesystem::path(numberPath), std::ios::binary};
+    file.write(tableText.data(), static_cast<std::streamsize>(tableText.size()));
     file.close();
     if (!file) throw std::runtime_error("Cannot write the syscall metadata cache.");
 
@@ -239,7 +254,7 @@ void StartInstructionEngine(DWORD pid, uint64_t mapping, SharedHeader& header, b
         auto start = GetProcAddress(localAgent.get(), "DetouristStartInstructions");
         if (!start) throw std::runtime_error("The instruction bootstrap export is missing.");
         auto offset = reinterpret_cast<uintptr_t>(start) - reinterpret_cast<uintptr_t>(localAgent.get());
-        auto agent = LoadCaptureAgent(process.get(), pid, agentPath, nullptr, startupToken);
+        auto agent = agentBase ? agentBase : LoadCaptureAgent(process.get(), pid, agentPath, nullptr, startupToken);
         header.instructionState = static_cast<LONG>(InstructionState::Starting);
         auto startupText = runtimePath + L"|" + std::to_wstring(mapping) + L"|" +
             std::to_wstring(header.captureIdentity);
@@ -254,9 +269,10 @@ void StartInstructionEngine(DWORD pid, uint64_t mapping, SharedHeader& header, b
         constexpr ULONGLONG InstructionTimeoutMs = 10000;
         constexpr DWORD InstructionPollMs = 10;
         auto deadline = GetTickCount64() + InstructionTimeoutMs;
-        while (header.instructionState != static_cast<LONG>(InstructionState::Active) &&
-            header.instructionState != static_cast<LONG>(InstructionState::Failed) && GetTickCount64() < deadline)
-            Sleep(InstructionPollMs);
+        for (uint32_t poll = 0; header.instructionState != static_cast<LONG>(InstructionState::Active) &&
+            header.instructionState != static_cast<LONG>(InstructionState::Failed) && GetTickCount64() < deadline;
+            ++poll)
+            Sleep(poll < 50 ? 1 : InstructionPollMs);
         if (header.instructionState != static_cast<LONG>(InstructionState::Active))
         {
             DWORD startupResult = STILL_ACTIVE;

@@ -37,6 +37,8 @@ struct SystemHook<Id, Result (WINAPI*)(Arguments...), Native>
 {
     using Function = Result (WINAPI*)(Arguments...);
     inline static Function original = nullptr;
+    static constexpr bool InvalidatesStackRegions = Id == Api::NtProtectVirtualMemory ||
+        Id == Api::NtFreeVirtualMemory || Id == Api::NtUnmapViewOfSection || Id == Api::NtUnmapViewOfSectionEx;
 
     template<size_t... Indices> static Result InvokeOriginal(Call& call, std::index_sequence<Indices...>)
     {
@@ -77,7 +79,13 @@ struct SystemHook<Id, Result (WINAPI*)(Arguments...), Native>
                     const uint64_t values[]{Bits(arguments)...};
                     PrepareNativeTermination(reinterpret_cast<HANDLE>(values[0]));
                 }
-            return original(arguments...);
+            if constexpr (InvalidatesStackRegions)
+            {
+                auto result = original(arguments...);
+                InvalidateStackImageCache();
+                return result;
+            }
+            else return original(arguments...);
         }
         Call call(Id, {Bits(arguments)...}, _ReturnAddress());
 
@@ -89,12 +97,14 @@ struct SystemHook<Id, Result (WINAPI*)(Arguments...), Native>
         if constexpr (std::is_void_v<Result>)
         {
             if (!call.skipped) InvokeOriginal(call, std::index_sequence_for<Arguments...>{});
+            if constexpr (InvalidatesStackRegions) InvalidateStackImageCache();
             call.Finish(0, GetLastError());
             SetLastError(call.event.error);
         }
         else
         {
             auto result = call.skipped ? Result{} : InvokeOriginal(call, std::index_sequence_for<Arguments...>{});
+            if constexpr (InvalidatesStackRegions) InvalidateStackImageCache();
             call.Finish(Bits(result), GetLastError());
             SetLastError(call.event.error);
             return SystemValue<Result>(call.event.result);

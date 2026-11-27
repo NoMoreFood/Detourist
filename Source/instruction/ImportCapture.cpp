@@ -18,6 +18,7 @@ struct ImportOrigin
 };
 
 constexpr uint32_t ImportBuckets = 512;
+constexpr uint32_t NonImportBuckets = 2048;
 constexpr DWORD MaxPeExports = 65536;
 constexpr size_t MaxImportDescriptors = 4096;
 constexpr uint64_t MaxImportThunks = 8192;
@@ -26,7 +27,13 @@ constexpr uint32_t MaxImportWrapperBytes = 512;
 constexpr uint32_t MaxImportOrigins = 8192;
 constexpr int XspRegisterIndex = 4;
 constexpr int XbpRegisterIndex = 5;
+struct NonImportCaller
+{
+    uint64_t caller;
+    app_pc importer;
+};
 ImportOrigin* ImportOrigins[ImportBuckets]{};
+NonImportCaller NonImportCallers[NonImportBuckets]{};
 uint64_t ImportEpoch = 0;
 uint32_t ImportOriginCount = 0;
 
@@ -443,18 +450,23 @@ InstructionDefinition* ResolveInstructionImport(InstructionDefinition* definitio
     auto direct = slot && ReadCaptureMemory(reinterpret_cast<void*>(slot), &target, sizeof(target)) &&
         target == definition->address;
     auto bucket = (caller >> 4) % ImportBuckets;
+    auto nonImportBucket = (caller >> 2) % NonImportBuckets;
     dr_mutex_lock(DefinitionLock);
     auto epoch = ImportEpoch;
     for (auto origin = ImportOrigins[bucket]; origin; origin = origin->next)
     {
-        if (!direct) break;
-        if (origin->caller != caller || direct && origin->slot != slot || origin->definition.retired ||
+        if (origin->caller != caller || (direct && origin->slot != slot) || origin->definition.retired ||
             origin->definition.address != definition->address) continue;
-        if (!ReadCaptureMemory(reinterpret_cast<void*>(origin->slot), &target, sizeof(target)) ||
-            target != definition->address) continue;
+        if (!direct && (!ReadCaptureMemory(reinterpret_cast<void*>(origin->slot), &target, sizeof(target)) ||
+            target != definition->address)) continue;
         auto result = &origin->definition;
         dr_mutex_unlock(DefinitionLock);
         return result;
+    }
+    if (!direct && NonImportCallers[nonImportBucket].caller == caller)
+    {
+        dr_mutex_unlock(DefinitionLock);
+        return definition;
     }
     dr_mutex_unlock(DefinitionLock);
     auto importer = dr_lookup_module(reinterpret_cast<app_pc>(caller - 1));
@@ -463,7 +475,15 @@ InstructionDefinition* ResolveInstructionImport(InstructionDefinition* definitio
     {
         thunk = 0;
         slot = ImportRegisterSlot(*importer, caller);
-        if (!slot || !ReadCaptureMemory(reinterpret_cast<void*>(slot), &target, sizeof(target)) ||
+        if (!slot)
+        {
+            dr_mutex_lock(DefinitionLock);
+            if (ImportEpoch == epoch) NonImportCallers[nonImportBucket] = {caller, importer->start};
+            dr_mutex_unlock(DefinitionLock);
+            dr_free_module_data(importer);
+            return definition;
+        }
+        if (!ReadCaptureMemory(reinterpret_cast<void*>(slot), &target, sizeof(target)) ||
             target != definition->address)
         {
             dr_free_module_data(importer);
@@ -553,6 +573,8 @@ void ForgetInstructionImports(const module_data_t* module)
             if (origin->importer == module->start || origin->provider == module->start ||
                 origin->definition.module == module->start)
                 origin->definition.retired = true;
+    for (auto& entry : NonImportCallers)
+        if (entry.importer == module->start) entry = {};
     dr_mutex_unlock(DefinitionLock);
 }
 
@@ -567,6 +589,7 @@ void FreeInstructionImports()
             dr_global_free(origin, sizeof(*origin));
         }
     }
+    memset(NonImportCallers, 0, sizeof(NonImportCallers));
     ImportOriginCount = 0;
 }
 }

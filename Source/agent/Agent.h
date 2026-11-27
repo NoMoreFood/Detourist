@@ -152,6 +152,8 @@ void DiscoverWin32ComOutput(Api api, uint64_t result, const uint64_t* arguments)
 void AddStackHooks(std::vector<HookDefinition>& hooks);
 bool IsStackHook(void* observer);
 void CaptureCallStack(Call& call, Slot* slot);
+void InvalidateStackImageCache() noexcept;
+void DetachObserverThread() noexcept;
 
 struct ExportCallInfo
 {

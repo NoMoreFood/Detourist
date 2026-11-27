@@ -28,7 +28,7 @@ constexpr ULONGLONG FlushIntervalMs = 20;
 constexpr DWORD PollIntervalMs = 10;
 constexpr DWORD IdleWaitMs = 2;
 constexpr DWORD BootstrapWaitMs = 1;
-constexpr size_t TransportBatchSize = 256;
+constexpr size_t TransportBatchSize = 2048;
 
 uintptr_t FindModule(DWORD pid, const std::wstring& module)
 {
@@ -538,10 +538,10 @@ void BootstrapTarget(DWORD pid, DWORD primaryThreadId, bool initializeLoader, [[
         if (error) throw std::runtime_error("Agent initialization failed: " + Utf8(ErrorText(error)));
         HANDLE ready[]{transport.ReadyEvent(), cancellation};
         auto deadline = GetTickCount64() + StartupTimeoutMs;
-        for (;;)
+        for (uint32_t poll = 0;; ++poll)
         {
             transport.ServiceThreadIds(process.get(), pid);
-            auto waited = WaitForMultipleObjects(cancellation ? 2 : 1, ready, FALSE, PollIntervalMs);
+            auto waited = WaitForMultipleObjects(cancellation ? 2 : 1, ready, FALSE, poll < 50 ? 1 : PollIntervalMs);
             if (waited == WAIT_OBJECT_0) break;
             if (waited == WAIT_TIMEOUT && GetTickCount64() < deadline) continue;
             InterlockedExchange(&header->stop, TransportStopping);
@@ -551,7 +551,7 @@ void BootstrapTarget(DWORD pid, DWORD primaryThreadId, bool initializeLoader, [[
             throw std::runtime_error("Capture hook installation failed: " + Utf8(ErrorText(header->error)));
 #ifdef DETOURIST_INSTRUCTION_ENGINE
         if (instructionEngine)
-            StartInstructionEngine(pid, agentStartup.handles.mapping, *header, launched, startupToken.get());
+            StartInstructionEngine(pid, agentStartup.handles.mapping, *header, launched, startupToken.get(), module);
 #else
         if (instructionEngine) throw std::runtime_error("The instruction engine is unavailable in this build.");
 #endif

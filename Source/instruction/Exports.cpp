@@ -35,6 +35,7 @@ uint32_t NextInterfaceId = InterfaceApiStart;
 uintptr_t ObserverRanges[4]{};
 BOOL (WINAPI* ObserverQuery)(ObserverContext*) = nullptr;
 void (WINAPI* ObserverUpdate)(const ObserverContext*) = nullptr;
+BOOL (WINAPI* ObserverBind)(ObserverThreadPointers*) = nullptr;
 uint64_t (WINAPI* AsyncCallbackFactory)(uint64_t, uint64_t, uint32_t, uint64_t*) = nullptr;
 uint32_t (WINAPI* NativeStackCapture)(const CONTEXT*, uint64_t, uint64_t*, uint32_t, uint32_t*) = nullptr;
 uint32_t (WINAPI* NativeRpcSerialization)(uint64_t) = nullptr;
@@ -46,6 +47,7 @@ uint32_t RpcMarshalDefinitionCount = 0;
 volatile LONG64* NativeHookAddresses = nullptr;
 volatile LONG* NativeHookApis = nullptr;
 volatile LONG64* InternalCallerRanges = nullptr;
+volatile LONG64* NativeStackImageEpoch = nullptr;
 constexpr const char* InternalCallerImages[]{"DetouristAgent.dll", "DetouristInstructions.dll",
     "dynamorio.dll", "drmgr.dll", "drwrap.dll", "drcontainers.dll", "DetouristProfiler.dll"};
 static_assert(std::size(InternalCallerImages) == InternalNativeImageCount);
@@ -139,6 +141,8 @@ void ObserverModule(const module_data_t* module)
                 dr_get_proc_address(module->handle, "DetouristGetObserverContext"));
             ObserverUpdate = reinterpret_cast<decltype(ObserverUpdate)>(
                 dr_get_proc_address(module->handle, "DetouristSetObserverContext"));
+            ObserverBind = reinterpret_cast<decltype(ObserverBind)>(
+                dr_get_proc_address(module->handle, "DetouristBindObserverThread"));
             AsyncCallbackFactory = reinterpret_cast<decltype(AsyncCallbackFactory)>(
                 dr_get_proc_address(module->handle, "DetouristAsyncCallback"));
             NativeStackCapture = reinterpret_cast<decltype(NativeStackCapture)>(
@@ -159,6 +163,8 @@ void ObserverModule(const module_data_t* module)
                 dr_get_proc_address(module->handle, "DetouristNativeHookApis"));
             InternalCallerRanges = reinterpret_cast<volatile LONG64*>(
                 dr_get_proc_address(module->handle, "DetouristInternalCallerRanges"));
+            NativeStackImageEpoch = reinterpret_cast<volatile LONG64*>(
+                dr_get_proc_address(module->handle, "DetouristStackImageEpoch"));
         }
     }
     if (InternalCallerRanges)
@@ -228,10 +234,38 @@ bool NativeOwnsCall(const InstructionDefinition& definition, const ObserverConte
             reinterpret_cast<uint64_t>(definition.marshalSlot))));
 }
 
-bool InstructionObserver(void* context, uint64_t caller, ObserverContext* observer)
+bool InstructionObserver(void* context, InstructionThread* thread, uint64_t caller, ObserverContext* observer)
 {
     for (int index = 0; index < 4; index += 2)
         if (caller >= ObserverRanges[index] && caller < ObserverRanges[index + 1]) return true;
+    // Bind per-thread TLS addresses once and drop them as soon as DLL_THREAD_DETACH retires the slot generation.
+    if (thread && thread->observerBound &&
+        thread->observer.slotGeneration->load(std::memory_order_acquire) != thread->observer.expectedGeneration)
+    {
+        thread->observerBound = false;
+        thread->observerDetached = true;
+    }
+    if (thread && !thread->observerBound && !thread->observerDetached && ObserverBind)
+    {
+        dr_switch_to_app_state(context);
+        thread->observerBound = ObserverBind(&thread->observer) != FALSE;
+        dr_switch_to_dr_state(context);
+    }
+    if (thread && thread->observerBound)
+    {
+        if (*thread->observer.processShuttingDown)
+        {
+            if (observer) *observer = {};
+            return false;
+        }
+        const auto active = *thread->observer.active;
+        if (observer)
+            *observer = {*thread->observer.captureIdentity, *thread->observer.parentId, *thread->observer.depth,
+                ObserverNativeReady | (active ? ObserverRecording : 0u) |
+                    (*thread->observer.followingChild ? ObserverFollowingChild : 0u),
+                *thread->observer.api, thread->observer.clock};
+        return active;
+    }
     if (!ObserverQuery) return false;
     ObserverContext value{};
     dr_switch_to_app_state(context);
@@ -241,8 +275,23 @@ bool InstructionObserver(void* context, uint64_t caller, ObserverContext* observ
     return (value.flags & ObserverRecording) != 0;
 }
 
-void SetInstructionObserver(void* context, const ObserverContext& observer)
+void SetInstructionObserver(void* context, InstructionThread& thread, const ObserverContext& observer)
 {
+    if (thread.observerBound &&
+        thread.observer.slotGeneration->load(std::memory_order_acquire) != thread.observer.expectedGeneration)
+    {
+        thread.observerBound = false;
+        thread.observerDetached = true;
+    }
+    if (thread.observerBound)
+    {
+        if (*thread.observer.processShuttingDown) return;
+        *thread.observer.captureIdentity = observer.captureIdentity;
+        *thread.observer.parentId = observer.parentId;
+        *thread.observer.depth = observer.depth;
+        *thread.observer.api = observer.api;
+        return;
+    }
     if (!ObserverUpdate) return;
     dr_switch_to_app_state(context);
     ObserverUpdate(&observer);
@@ -1023,7 +1072,7 @@ void DiscoverReturnedExtensions(InstructionFrame& frame)
     if (frame.definition->wglLookup) DiscoverWglExtension(frame);
 }
 
-void DiscoverExports(const module_data_t* module)
+void DiscoverExports(const module_data_t* module, bool forwardersOnly)
 {
     const auto name = ImageFileName(module);
     if (!name || !_stricmp(name, "DetouristAgent.dll") || !_stricmp(name, "DetouristProfiler.dll") ||
@@ -1040,23 +1089,35 @@ void DiscoverExports(const module_data_t* module)
         !ReadCaptureMemory(module->start + dos.e_lfanew, &image, sizeof(image)) ||
         image.Signature != IMAGE_NT_SIGNATURE)
         return;
+    const auto& directory = image.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (forwardersOnly && (!directory.VirtualAddress || !directory.Size)) return;
 
     // Export forwarder passes reuse immutable RTTI data until the image unloads.
-    bool firstPass = true;
-    dr_mutex_lock(DefinitionLock);
-    auto empty = DiscoveredExportImages.end();
-    for (auto scanned = DiscoveredExportImages.begin(); scanned != DiscoveredExportImages.end(); ++scanned)
+    bool firstPass = !forwardersOnly;
+    if (!forwardersOnly)
     {
-        if (*scanned == module->start) { firstPass = false; break; }
-        if (!*scanned && empty == DiscoveredExportImages.end()) empty = scanned;
+        dr_mutex_lock(DefinitionLock);
+        auto empty = DiscoveredExportImages.end();
+        for (auto scanned = DiscoveredExportImages.begin(); scanned != DiscoveredExportImages.end(); ++scanned)
+        {
+            if (*scanned == module->start) { firstPass = false; break; }
+            if (!*scanned && empty == DiscoveredExportImages.end()) empty = scanned;
+        }
+        if (firstPass && empty != DiscoveredExportImages.end()) *empty = module->start;
+        dr_mutex_unlock(DefinitionLock);
     }
-    if (firstPass && empty != DiscoveredExportImages.end()) *empty = module->start;
-    dr_mutex_unlock(DefinitionLock);
 
     if (firstPass) DiscoverImageInterfaces(module, uint64_t{static_cast<uint32_t>(dos.e_lfanew)} +
         offsetof(IMAGE_NT_HEADERS, OptionalHeader) + image.FileHeader.SizeOfOptionalHeader,
         image.FileHeader.NumberOfSections);
-    const auto& directory = image.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    dr_mem_info_t execRegion{};
+    auto executableAddress = [&](app_pc target)
+    {
+        auto offset = reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(execRegion.base_pc);
+        if (offset < execRegion.size) return (execRegion.prot & DR_MEMPROT_EXEC) != 0;
+        if (!dr_query_memory_ex(target, &execRegion)) { execRegion = {}; return false; }
+        return (execRegion.prot & DR_MEMPROT_EXEC) != 0;
+    };
     auto observe = [&](const char* symbolName, DWORD functionRva, DWORD ordinal,
         const RuntimeExport* callback = nullptr)
     {
@@ -1080,9 +1141,7 @@ void DiscoverExports(const module_data_t* module)
         {
             address = ForwardAddress(reinterpret_cast<const char*>(address));
         }
-        uint protection = 0;
-        if (!address || !dr_query_memory(address, nullptr, nullptr, &protection) ||
-            !(protection & DR_MEMPROT_EXEC)) return;
+        if (!address || !executableAddress(address)) return;
         if (!_stricmp(name, "ntdll.dll") && exportName[0] == 'Z' && exportName[1] == 'w')
         {
             exportName[0] = 'N';
@@ -1278,11 +1337,11 @@ void DiscoverExports(const module_data_t* module)
     };
 
     // The loader calls image entry points and TLS callbacks even in DLLs without exported functions.
-    if (image.FileHeader.Characteristics & IMAGE_FILE_DLL)
+    if (!forwardersOnly && (image.FileHeader.Characteristics & IMAGE_FILE_DLL))
         observe("DllMain", image.OptionalHeader.AddressOfEntryPoint, 0, RuntimeDefinitionFor(name, "DllMain"));
     const auto& tlsDirectory = image.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     IMAGE_TLS_DIRECTORY tls{};
-    if (tlsDirectory.VirtualAddress && tlsDirectory.Size >= sizeof(tls) &&
+    if (!forwardersOnly && tlsDirectory.VirtualAddress && tlsDirectory.Size >= sizeof(tls) &&
         uint64_t{tlsDirectory.VirtualAddress} + sizeof(tls) <= extent &&
         ReadCaptureMemory(module->start + tlsDirectory.VirtualAddress, &tls, sizeof(tls)))
     {
@@ -1316,19 +1375,25 @@ void DiscoverExports(const module_data_t* module)
     }
 
     // Read the complete export address table so ordinal-only APIs receive the same tracing as named exports.
+    auto isForwarderRva = [&](DWORD functionRva)
+    {
+        return functionRva >= directory.VirtualAddress &&
+            uint64_t{functionRva} < uint64_t{directory.VirtualAddress} + directory.Size;
+    };
     auto named = static_cast<byte*>(dr_global_alloc(exports.NumberOfFunctions));
     memset(named, 0, exports.NumberOfFunctions);
     for (DWORD index = 0; index < exports.NumberOfNames; ++index)
     {
         DWORD nameRva = 0, functionRva = 0;
         WORD ordinalIndex = 0;
-        if (!ReadCaptureMemory(module->start + exports.AddressOfNames + uint64_t{index} * sizeof(DWORD),
-                &nameRva, sizeof(nameRva)) || nameRva >= extent ||
-            !ReadCaptureMemory(module->start + exports.AddressOfNameOrdinals + uint64_t{index} * sizeof(WORD),
+        if (!ReadCaptureMemory(module->start + exports.AddressOfNameOrdinals + uint64_t{index} * sizeof(WORD),
                 &ordinalIndex, sizeof(ordinalIndex)) || ordinalIndex >= exports.NumberOfFunctions ||
             !ReadCaptureMemory(module->start + exports.AddressOfFunctions + uint64_t{ordinalIndex} * sizeof(DWORD),
                 &functionRva, sizeof(functionRva))) continue;
         named[ordinalIndex] = 1;
+        if (forwardersOnly && !isForwarderRva(functionRva)) continue;
+        if (!ReadCaptureMemory(module->start + exports.AddressOfNames + uint64_t{index} * sizeof(DWORD),
+                &nameRva, sizeof(nameRva)) || nameRva >= extent) continue;
         observe(reinterpret_cast<const char*>(module->start + nameRva), functionRva, exports.Base + ordinalIndex);
     }
     for (DWORD index = 0; index < exports.NumberOfFunctions; ++index)
@@ -1336,7 +1401,8 @@ void DiscoverExports(const module_data_t* module)
         DWORD functionRva = 0;
         if (!named[index] &&
             ReadCaptureMemory(module->start + exports.AddressOfFunctions + uint64_t{index} * sizeof(DWORD),
-                &functionRva, sizeof(functionRva)))
+                &functionRva, sizeof(functionRva)) &&
+            (!forwardersOnly || isForwarderRva(functionRva)))
             observe(nullptr, functionRva, exports.Base + index);
     }
     dr_global_free(named, exports.NumberOfFunctions);

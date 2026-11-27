@@ -170,6 +170,8 @@ struct InstructionSyscalls
 struct InstructionThread
 {
     CaptureClock clock;
+    ObserverThreadPointers observer;
+    bool observerBound, observerDetached;
     InstructionFrames* blocks;
     InstructionFrame* freeFrames;
     InstructionFrame* current;
@@ -190,6 +192,8 @@ void FreeCaptureCatalog();
 const RuntimeInterface* RuntimeInterfaceFor(const GUID& iid);
 const RuntimeExport* RuntimeInterfaceMethod(const RuntimeInterface& contract, uint32_t slot);
 const GUID* RuntimeInterfaceIdentity(uint16_t index);
+const CatalogInterface* CatalogInterfaceByName(const char* name);
+const CatalogInterface* CatalogInterfaceByRtti(const char* decorated);
 bool RuntimeImplicitArrayCount(const InstructionFrame& call, uint32_t index, uint64_t& count);
 struct FormatCaptureResult
 {
@@ -245,7 +249,7 @@ Api FindExportType(const char* module, const char* name);
 uint32_t RawWin32uArguments(const char* name);
 InstructionDefinition* ExportDefinitionAt(void* address);
 void InitializeExports();
-void DiscoverExports(const module_data_t* module);
+void DiscoverExports(const module_data_t* module, bool forwardersOnly = false);
 void RemoveExports(const module_data_t* module);
 void FreeExports();
 void EndExportThread(void* context, InstructionThread& thread);
@@ -254,8 +258,9 @@ void CompleteInstructionChild(InstructionFrame& call, bool success);
 bool InstructionBreakpoint(InstructionFrame& call, bool leaving);
 void SetApplicationError(void* context, uint32_t error);
 uint32_t ApplicationError(void* context);
-bool InstructionObserver(void* context, uint64_t caller, ObserverContext* observer = nullptr);
-void SetInstructionObserver(void* context, const ObserverContext& observer);
+bool InstructionObserver(void* context, InstructionThread* thread, uint64_t caller,
+    ObserverContext* observer = nullptr);
+void SetInstructionObserver(void* context, InstructionThread& thread, const ObserverContext& observer);
 bool ReadInstructionString(const char* source, char* output, size_t capacity);
 InstructionDefinition* ResolveInstructionImport(InstructionDefinition* definition, uint64_t caller);
 void ForgetInstructionImports(const module_data_t* module);
@@ -273,6 +278,8 @@ bool WriteInstructionArgument(void* wrapped, dr_mcontext_t& machine, const Expor
 uint64_t PrepareAsyncCallback(void* context, InstructionFrame& frame, uint32_t& parameter);
 extern InstructionChannel InstructionTransport;
 extern void* DefinitionLock;
+extern volatile LONG ObservedComActive;
+extern volatile LONG64* NativeStackImageEpoch;
 extern int ThreadSlot;
 extern int SyscallSlot;
 }

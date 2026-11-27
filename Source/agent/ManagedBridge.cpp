@@ -21,14 +21,31 @@ struct ManagedDefinition
 };
 
 constexpr size_t ManagedDefinitionCapacity = 65536;
+constexpr size_t BoundObserverSlotCapacity = 4096;
 constexpr unsigned ManagedPageShift = 12;
 constexpr size_t ManagedCodePageCount = size_t{1} << (32 - ManagedPageShift);
 
 SRWLOCK ManagedDefinitionsLock = SRWLOCK_INIT;
 std::array<std::atomic<ManagedDefinition*>, ManagedDefinitionCapacity> ManagedDefinitions{};
+std::array<std::atomic<uint64_t>, BoundObserverSlotCapacity> BoundObserverGenerations{};
+std::atomic<uint64_t> NextBoundObserverGeneration = 1;
+[[msvc::no_tls_guard]] constinit thread_local uint32_t BoundObserverSlot = 0;
+[[msvc::no_tls_guard]] constinit thread_local uint64_t BoundObserverGeneration = 0;
+[[msvc::no_tls_guard]] constinit thread_local bool ObserverThreadDetached = false;
 uint32_t ManagedDefinitionCount = 0;
 volatile LONG ManagedProfilerState = static_cast<LONG>(ManagedState::Inactive);
 void WINAPI ManagedStatus(uint32_t state);
+
+void DetachObserverThread() noexcept
+{
+    if (!NativeThreadReady()) return;
+    ObserverThreadDetached = true;
+    if (!BoundObserverSlot) return;
+    auto expected = BoundObserverGeneration;
+    BoundObserverGenerations[BoundObserverSlot - 1].compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    BoundObserverSlot = 0;
+    BoundObserverGeneration = 0;
+}
 
 #if defined(_M_IX86)
 // Plain zero-initialized storage avoids expanding a million atomic constructors during compilation.
@@ -331,5 +348,42 @@ extern "C" __declspec(dllexport) void WINAPI DetouristSetObserverContext(const D
     ParentCall = context->parentId;
     CallDepth = context->depth;
     CallApi = static_cast<Api>(context->api);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI DetouristBindObserverThread(Detourist::ObserverThreadPointers* pointers)
+{
+    using namespace Detourist;
+    static_assert(sizeof(Api) == sizeof(uint32_t));
+    if (!pointers || !NativeThreadReady() || ObserverThreadDetached) return FALSE;
+
+    // Guard bound TLS pointers with a pinned slot generation cleared before loader thread-detach frees TLS memory.
+    if (BoundObserverSlot &&
+        BoundObserverGenerations[BoundObserverSlot - 1].load(std::memory_order_acquire) != BoundObserverGeneration)
+    {
+        BoundObserverSlot = 0;
+        BoundObserverGeneration = 0;
+    }
+    if (!BoundObserverSlot)
+    {
+        const auto generation = NextBoundObserverGeneration.fetch_add(1, std::memory_order_relaxed);
+        const auto start = static_cast<size_t>(GetCurrentThreadId()) % BoundObserverSlotCapacity;
+        for (size_t step = 0; step < BoundObserverSlotCapacity; ++step)
+        {
+            const auto index = (start + step) % BoundObserverSlotCapacity;
+            uint64_t expected = 0;
+            if (BoundObserverGenerations[index].compare_exchange_strong(expected, generation,
+                std::memory_order_acq_rel))
+            {
+                BoundObserverSlot = static_cast<uint32_t>(index + 1);
+                BoundObserverGeneration = generation;
+                break;
+            }
+        }
+        if (!BoundObserverSlot) return FALSE;
+    }
+    *pointers = {&BoundObserverGenerations[BoundObserverSlot - 1], BoundObserverGeneration,
+        &CallIdentity, &ParentCall, &CallDepth, reinterpret_cast<uint32_t*>(&CallApi),
+        &ObserverActive, &FollowingChild, &CaptureTime, &ProcessShuttingDown};
+    return TRUE;
 }
 

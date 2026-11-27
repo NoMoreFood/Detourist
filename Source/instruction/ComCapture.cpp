@@ -31,6 +31,7 @@ struct ObservedComTable
 };
 std::array<ObservedComTable, ObservedComTableCapacity> ObservedComTables{};
 std::atomic<uint64_t> NextComGeneration = 0;
+volatile LONG ObservedComActive = 0;
 
 ObservedComTable FindObservedComTable(void* table)
 {
@@ -220,6 +221,7 @@ void ObserveInstructionInterface(void* instance, const GUID& iid)
     }
     if (available) *available = {table, iid, count, prefix, ++NextComGeneration};
     else if (!found) InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_ENOUGH_MEMORY;
+    if (available || found) InterlockedExchange(&ObservedComActive, 1);
     dr_mutex_unlock(DefinitionLock);
 }
 
@@ -378,16 +380,14 @@ bool ReadRttiTypeName(const module_data_t* module, uint64_t extent, uint32_t typ
 
     // Match SDK-generated closed interfaces directly, avoiding template parsing or target-side reflection.
     auto& catalog = InstructionTransport.catalog;
-    for (uint32_t entry = 0; projected && entry < catalog.Header()->interfaceCount; ++entry)
-    {
-        const auto& contract = catalog.Interfaces()[entry];
-        auto spelling = contract.rttiName ? catalog.Text(contract.rttiName) : nullptr;
-        if (!spelling || strcmp(spelling, decorated)) continue;
-        auto label = catalog.Text(contract.name);
-        if (!label || strlen(label) >= capacity) return false;
-        memcpy(name, label, strlen(label) + 1);
-        return true;
-    }
+    if (projected)
+        if (auto contract = CatalogInterfaceByRtti(decorated))
+        {
+            auto label = catalog.Text(contract->name);
+            if (!label || strlen(label) >= capacity) return false;
+            memcpy(name, label, strlen(label) + 1);
+            return true;
+        }
     char* parts[32]{};
     size_t count = 0, used = 0;
     if (projected) cursor += 12;
@@ -467,7 +467,6 @@ RttiInterface IdentifyImageInterface(const module_data_t* module, uint64_t exten
     }
     bool unknown = false, deferred = false;
     const CatalogInterface* selected = nullptr;
-    auto& catalog = InstructionTransport.catalog;
 
     // Match the receiver's subobject using the same PMD and construction offsets as the MSVC runtime.
     for (uint32_t index = 0; index < hierarchy.count; ++index)
@@ -501,13 +500,9 @@ RttiInterface IdentifyImageInterface(const module_data_t* module, uint64_t exten
         }
         if (!match) continue;
         unknown |= !strcmp(name, "IUnknown");
-        for (uint32_t entry = 0; entry < catalog.Header()->interfaceCount; ++entry)
-        {
-            const auto& contract = catalog.Interfaces()[entry];
-            auto label = catalog.Text(contract.name);
-            if (label && !strcmp(label, name) && (!selected || contract.slotCount > selected->slotCount))
-                selected = &contract;
-        }
+        if (auto contract = CatalogInterfaceByName(name);
+            contract && (!selected || contract->slotCount > selected->slotCount))
+            selected = contract;
     }
     if (!unknown && !deferred) return RttiInterface::None;
     iid = selected ? selected->iid : __uuidof(IUnknown);

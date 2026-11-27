@@ -25,6 +25,7 @@ char SyscallNames[SyscallTableCapacity][MaxSyscallNameBytes]{};
 uint32_t SyscallNumbers[SyscallTableCapacity]{};
 uint8_t SyscallRawCounts[SyscallTableCapacity]{};
 bool SyscallContinuations[SyscallTableCapacity]{};
+bool SyscallInvalidatesStack[SyscallTableCapacity]{};
 AsyncIoRole SyscallAsyncRoles[SyscallTableCapacity]{};
 
 struct ExtendedSyscall
@@ -357,6 +358,9 @@ bool PreSyscall(void* context, int number)
 #ifndef _WIN64
     number &= 0xFFFF;
 #endif
+    if (NativeStackImageEpoch && static_cast<uint32_t>(number) < std::size(SyscallInvalidatesStack) &&
+        SyscallInvalidatesStack[number])
+        InterlockedIncrement64(NativeStackImageEpoch);
     auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
     auto syscalls = static_cast<InstructionSyscalls*>(drmgr_get_cls_field(context, SyscallSlot));
     if (!thread || !syscalls) return true;
@@ -392,7 +396,7 @@ bool PreSyscall(void* context, int number)
     frame.event.caller = site;
     frame.stackPointer = machine.xsp;
     ObserverContext observer{};
-    if (InstructionObserver(context, site, &observer)) return true;
+    if (InstructionObserver(context, thread, site, &observer)) return true;
     CaptureObservation capture(observer.clock ? observer.clock : &thread->clock, Clock());
     frame.clock = capture.clock;
     frame.invocationStarted = capture.ApplicationTime();
@@ -633,8 +637,14 @@ void CompleteSyscall(void* context, InstructionFrame& frame, dr_mcontext_t* resu
     if (frame.counted) InterlockedDecrement64(&InstructionTransport.Header()->activeCalls);
 }
 
-void PostSyscall(void* context, int)
+void PostSyscall(void* context, int number)
 {
+#ifndef _WIN64
+    number &= 0xFFFF;
+#endif
+    if (NativeStackImageEpoch && static_cast<uint32_t>(number) < std::size(SyscallInvalidatesStack) &&
+        SyscallInvalidatesStack[number])
+        InterlockedIncrement64(NativeStackImageEpoch);
     auto syscalls = static_cast<InstructionSyscalls*>(drmgr_get_cls_field(context, SyscallSlot));
     if (!syscalls) return;
     if (syscalls->overflow) { --syscalls->overflow; return; }
@@ -710,6 +720,32 @@ uint32_t SpilledComSlot(instr_t* call, opnd_t target)
     return UINT32_MAX;
 }
 
+bool StaticIndirectTarget(instr_t* call, opnd_t target)
+{
+    // Static import slots in image data cannot hold a receiver-dependent COM vtable method pointer.
+    uint32_t remaining = SpilledComScanLimit;
+    for (auto previous = instr_get_prev_app(call); previous && remaining--; previous = instr_get_prev_app(previous))
+    {
+        if (instr_is_cti(previous)) break;
+        if (opnd_is_base_disp(target) &&
+            instr_writes_to_reg(previous, opnd_get_base(target), DR_QUERY_DEFAULT)) break;
+        const bool writes = opnd_is_reg(target) ?
+            instr_writes_to_reg(previous, opnd_get_reg(target), DR_QUERY_DEFAULT) : instr_writes_memory(previous);
+        if (!writes) continue;
+        if (!instr_is_mov(previous) || instr_num_dsts(previous) != 1 || instr_num_srcs(previous) != 1 ||
+            !opnd_same(instr_get_dst(previous, 0), target)) break;
+        target = instr_get_src(previous, 0);
+        if (opnd_size_in_bytes(opnd_get_size(target)) != sizeof(void*)) break;
+        if (InstructionStaticAddress(target)) return true;
+        if (opnd_is_reg(target)) continue;
+        if (!opnd_is_base_disp(target) || opnd_get_index(target) != DR_REG_NULL) break;
+        const auto base = opnd_get_base(target);
+        if (base == DR_REG_XSP || base == DR_REG_XBP) continue;
+        break;
+    }
+    return false;
+}
+
 dr_emit_flags_t InstrumentInstruction(void* context, void* tag, instrlist_t* instructions,
     instr_t* instruction, bool, bool, void*)
 {
@@ -741,13 +777,15 @@ dr_emit_flags_t InstrumentInstruction(void* context, void* tag, instrlist_t* ins
 
         const bool stackTarget = opnd_is_base_disp(target) && opnd_get_index(target) == DR_REG_NULL &&
             (opnd_get_base(target) == DR_REG_XSP || opnd_get_base(target) == DR_REG_XBP);
+        const bool copied = opnd_is_reg(target) || stackTarget;
+        const bool staticTarget = copied && StaticIndirectTarget(instruction, target);
 
         // Observe derived dispatch only when its receiver belongs to an established COM table.
-        if (opnd_is_reg(target) || stackTarget || (opnd_is_base_disp(target) &&
+        if (!staticTarget && (copied || (opnd_is_base_disp(target) &&
             opnd_get_base(target) != DR_REG_NULL && opnd_get_index(target) == DR_REG_NULL &&
             opnd_get_disp(target) >= static_cast<int>(UnknownSlotCount * sizeof(void*)) &&
             opnd_get_disp(target) % sizeof(void*) == 0 &&
-            opnd_get_disp(target) / sizeof(void*) < MaxComVtableSlots))
+            opnd_get_disp(target) / sizeof(void*) < MaxComVtableSlots)))
         {
             auto skip = INSTR_CREATE_label(context), done = INSTR_CREATE_label(context);
             dr_save_arith_flags(context, instructions, instruction, SPILL_SLOT_2);
@@ -756,12 +794,19 @@ dr_emit_flags_t InstrumentInstruction(void* context, void* tag, instrlist_t* ins
                 OPND_CREATE_INT32(static_cast<int>(ComApis))));
             instrlist_meta_preinsert(instructions, instruction,
                 INSTR_CREATE_jcc(context, OP_jz, opnd_create_instr(skip)));
+            if (copied)
+            {
+                instrlist_meta_preinsert(instructions, instruction, INSTR_CREATE_cmp(context,
+                    OPND_CREATE_ABSMEM(const_cast<LONG*>(&ObservedComActive), OPSZ_4),
+                    OPND_CREATE_INT32(0)));
+                instrlist_meta_preinsert(instructions, instruction,
+                    INSTR_CREATE_jcc(context, OP_jz, opnd_create_instr(skip)));
+            }
             instrlist_meta_preinsert(instructions, instruction,
                 INSTR_CREATE_cmp(context, arguments[0], OPND_CREATE_INT32(static_cast<int32_t>(MinimumUserAddress))));
             instrlist_meta_preinsert(instructions, instruction,
                 INSTR_CREATE_jcc(context, OP_jb, opnd_create_instr(skip)));
             dr_restore_arith_flags(context, instructions, instruction, SPILL_SLOT_2);
-            const bool copied = opnd_is_reg(target) || stackTarget;
             auto base = copied ? OPND_CREATE_INTPTR(0) : opnd_create_reg(opnd_get_base(target));
             auto slot = copied ? SpilledComSlot(instruction, target) :
                 static_cast<uint32_t>(opnd_get_disp(target) / sizeof(void*));
@@ -778,12 +823,17 @@ dr_emit_flags_t InstrumentInstruction(void* context, void* tag, instrlist_t* ins
         }
 
         // Inspect register, spilled and first-slot calls; static import slots need no runtime probe.
-        if (opnd_is_reg(target) || stackTarget || (opnd_is_base_disp(target) &&
+        if (!staticTarget && (copied || (opnd_is_base_disp(target) &&
             opnd_get_base(target) != DR_REG_NULL &&
-            opnd_get_index(target) == DR_REG_NULL && opnd_get_disp(target) == 0))
+            opnd_get_index(target) == DR_REG_NULL && opnd_get_disp(target) == 0)))
         {
             auto skip = INSTR_CREATE_label(context), done = INSTR_CREATE_label(context);
             dr_save_arith_flags(context, instructions, instruction, SPILL_SLOT_2);
+            instrlist_meta_preinsert(instructions, instruction, INSTR_CREATE_test(context,
+                OPND_CREATE_ABSMEM(const_cast<LONGLONG*>(&InstructionTransport.Header()->enabledFilters), OPSZ_4),
+                OPND_CREATE_INT32(static_cast<int>(ComApis))));
+            instrlist_meta_preinsert(instructions, instruction,
+                INSTR_CREATE_jcc(context, OP_jz, opnd_create_instr(skip)));
             for (auto argument : arguments)
             {
                 instrlist_meta_preinsert(instructions, instruction,
@@ -847,6 +897,11 @@ void ThreadEnded(void* context)
 {
     auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
     if (!thread) return;
+    if (thread->observerBound && thread->observer.slotGeneration)
+    {
+        auto expected = thread->observer.expectedGeneration;
+        thread->observer.slotGeneration->compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    }
     EndExportThread(context, *thread);
     dr_thread_free(context, thread, sizeof(*thread));
 }
@@ -924,6 +979,7 @@ void ModuleUnloaded(void*, const module_data_t* module)
 void InstructionExit()
 {
     ResetMruCapture(0);
+    InterlockedExchange(&ObservedComActive, 0);
     while (GuardDispatches)
     {
         auto dispatch = GuardDispatches;
@@ -1034,6 +1090,9 @@ DR_EXPORT void dr_client_main(client_id_t, int argc, const char* argv[])
                     SyscallContinuations[number] = !strcmp(line, "NtContinue") || !strcmp(line, "NtContinueEx") ||
                         !strcmp(line, "NtCallbackReturn") || !strcmp(line, "NtRaiseException") ||
                         !strcmp(line, "NtTerminateProcess") || !strcmp(line, "NtTerminateThread");
+                    SyscallInvalidatesStack[number] = !strcmp(line, "NtProtectVirtualMemory") ||
+                        !strcmp(line, "NtFreeVirtualMemory") || !strcmp(line, "NtUnmapViewOfSection") ||
+                        !strcmp(line, "NtUnmapViewOfSectionEx");
                 }
             }
             line = end;
@@ -1094,7 +1153,8 @@ DR_EXPORT void dr_client_main(client_id_t, int argc, const char* argv[])
         while (dr_module_iterator_hasnext(modules))
         {
             auto module = dr_module_iterator_next(modules);
-            ModuleLoaded(nullptr, module, true);
+            if (!pass) ModuleLoaded(nullptr, module, true);
+            else DiscoverExports(module, true);
             dr_free_module_data(module);
         }
         dr_module_iterator_stop(modules);

@@ -120,6 +120,7 @@ void CALLBACK ObserveModuleChange(ULONG reason, const ModuleNotification* notifi
 {
     if (reason != static_cast<ULONG>(ModuleChangeReason::Load) &&
         reason != static_cast<ULONG>(ModuleChangeReason::Unload)) return;
+    InvalidateStackImageCache();
     InterlockedIncrement(&ModuleHistoryReaders);
     auto header = ModuleHistory.load();
     if (header)

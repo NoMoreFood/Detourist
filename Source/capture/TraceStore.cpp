@@ -31,19 +31,29 @@ void SqlCheck(int status, sqlite3* database)
     if (status != SQLITE_OK && status != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(database));
 }
 
-struct SnapshotBuffer
+static uint64_t HashSnapshotBytes(std::string_view bytes)
 {
-    std::string_view header, data;
-    auto Key() const { return std::tuple{data.size(), data, header}; }
-};
+    uint64_t hash = Fnv1aOffsetBasis64;
+    size_t index = 0;
+    for (; index + sizeof(uint64_t) <= bytes.size(); index += sizeof(uint64_t))
+    {
+        uint64_t word = 0;
+        memcpy(&word, bytes.data() + index, sizeof(word));
+        hash = (hash ^ word) * Fnv1aPrime64;
+    }
+    for (; index < bytes.size(); ++index)
+        hash = (hash ^ static_cast<uint8_t>(bytes[index])) * Fnv1aPrime64;
+    return hash;
+}
 
-static bool NextBuffer(std::string_view& remaining, SnapshotBuffer& buffer)
+bool TraceStore::NextBuffer(std::string_view& remaining, SnapshotBuffer& buffer)
 {
     Value header;
     if (remaining.size() < sizeof(header)) return false;
     memcpy(&header, remaining.data(), sizeof(header));
     if (header.capturedBytes > remaining.size() - sizeof(header)) return false;
-    buffer = {remaining.substr(0, sizeof(header)), remaining.substr(sizeof(header), header.capturedBytes)};
+    auto data = remaining.substr(sizeof(header), header.capturedBytes);
+    buffer = {remaining.substr(0, sizeof(header)), data, HashSnapshotBytes(data)};
     remaining.remove_prefix(sizeof(header) + header.capturedBytes);
     return true;
 }
@@ -63,7 +73,7 @@ static void AppendRange(std::string& text, sqlite3_int64 start, size_t length)
     text += "],";
 }
 
-static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
+void TraceStore::PackReturn(sqlite3_context* context, int, sqlite3_value** values)
 {
     // Keep the original SQLite value for absent, malformed or incompressible snapshots.
     sqlite3_result_value(context, values[1]);
@@ -82,8 +92,17 @@ static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
 
     try
     {
-        // Exact bytes identify reusable buffers. Sort headers last to prefer a match that also shares the metadata.
-        std::vector<SnapshotBuffer> buffers;
+        auto* store = static_cast<TraceStore*>(sqlite3_user_data(context));
+        std::vector<SnapshotBuffer> localBuffers;
+        std::vector<std::pair<int, int>> localRanges;
+        std::string localPacked;
+        auto& buffers = store ? store->packBuffers_ : localBuffers;
+        auto& ranges = store ? store->packRanges_ : localRanges;
+        auto& packed = store ? store->packedReturn_ : localPacked;
+        buffers.clear();
+        ranges.clear();
+
+        // Hash and size narrow candidate matches before comparing full byte slices.
         SnapshotBuffer buffer{};
         for (auto remaining = input; !remaining.empty();)
         {
@@ -93,7 +112,6 @@ static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
         std::ranges::sort(buffers, {}, &SnapshotBuffer::Key);
 
         // Positive offsets refer to entry bytes. Keep literal return ranges in their original order.
-        std::vector<std::pair<int, int>> ranges;
         auto literal = after;
         int literalBytes = 0;
         auto appendLiteral = [&](const char* end)
@@ -107,10 +125,11 @@ static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
         {
             if (!NextBuffer(remaining, buffer)) return;
             auto found = std::ranges::lower_bound(buffers, buffer.Key(), {}, &SnapshotBuffer::Key);
-            if (found == buffers.end() || found->data != buffer.data)
+            if (found == buffers.end() || found->hash != buffer.hash || found->data != buffer.data)
             {
                 if (found == buffers.begin()) continue;
-                if ((--found)->data != buffer.data) continue;
+                --found;
+                if (found->hash != buffer.hash || found->data != buffer.data) continue;
             }
             const auto headerBytes = found->header == buffer.header ? sizeof(Value) : 0;
             auto length = static_cast<int>(headerBytes + buffer.data.size());
@@ -126,7 +145,7 @@ static void PackReturn(sqlite3_context* context, int, sqlite3_value** values)
         appendLiteral(after + outputSize);
 
         // A NUL terminates the JSON ranges. Negative SQLite offsets address literal bytes from the end of the blob.
-        std::string packed = "[";
+        packed.assign(1, '[');
         int tail = -literalBytes;
         for (auto [offset, length] : ranges)
         {
@@ -170,7 +189,7 @@ TraceStore::TraceStore(const std::wstring& path)
     {
         sqlite3_busy_timeout(database_, TraceWriteBusyTimeoutMs);
         SqlCheck(sqlite3_create_function_v2(database_, "pack_return", 2,
-            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, nullptr, PackReturn, nullptr, nullptr, nullptr),
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, this, PackReturn, nullptr, nullptr, nullptr),
             database_);
 
         // Grow the trace to each checkpoint's final extent before copying its pages on Windows.
@@ -288,6 +307,12 @@ TraceStore::TraceStore(const std::wstring& path)
         Execute("COMMIT");
         SqlCheck(sqlite3_prepare_v2(database_, "INSERT INTO input_blocks(id,data) VALUES(?,?)",
             -1, &insertBlock_, nullptr), database_);
+        SqlCheck(sqlite3_prepare_v2(database_, "INSERT OR IGNORE INTO apis VALUES(?,?,?,?,?,?,?)",
+            -1, &insertApi_, nullptr), database_);
+        SqlCheck(sqlite3_prepare_v2(database_, "INSERT OR IGNORE INTO threads VALUES(?,?)",
+            -1, &insertThread_, nullptr), database_);
+        SqlCheck(sqlite3_prepare_v2(database_, "UPDATE session SET total_calls=?",
+            -1, &updateTotals_, nullptr), database_);
         sqlite3_rollback_hook(database_, [](void* context)
         {
             auto& store = *static_cast<TraceStore*>(context);
@@ -302,7 +327,8 @@ TraceStore::TraceStore(const std::wstring& path)
         SqlCheck(sqlite3_prepare_v2(database_, "INSERT INTO call_records(target,id,tid,api,started,parent,depth,caller,"
             "arguments,flags,input,ended,result,error,output,module_epoch,adjusted_duration,output_length,input_parts) "
             "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,coalesce(?18,?11),?12,?13,?14,"
-            "pack_return(?11,?15),?16,?17,length(?15),?19)",
+            "CASE WHEN length(?11)>0 AND length(?15)>0 THEN pack_return(?11,?15) ELSE ?15 END,"
+            "?16,?17,length(?15),?19)",
             -1, &enter_, nullptr), database_);
         auto leaveSql = std::string("UPDATE call_records SET ended=?1, result=?2, error=?3,"
             " flags=CASE WHEN (flags & ") + std::to_string(AsyncCompleted) + ")!=0 THEN (?4 & ~" +
@@ -333,6 +359,9 @@ TraceStore::TraceStore(const std::wstring& path)
     {
         sqlite3_close(checkpointDatabase_);
         sqlite3_finalize(insertBlock_);
+        sqlite3_finalize(insertApi_);
+        sqlite3_finalize(insertThread_);
+        sqlite3_finalize(updateTotals_);
         sqlite3_finalize(enter_);
         sqlite3_finalize(leave_);
         sqlite3_close(database_);
@@ -345,6 +374,9 @@ TraceStore::~TraceStore()
     if (checkpoint_.valid()) checkpoint_.wait();
     sqlite3_close(checkpointDatabase_);
     sqlite3_finalize(insertBlock_);
+    sqlite3_finalize(insertApi_);
+    sqlite3_finalize(insertThread_);
+    sqlite3_finalize(updateTotals_);
     sqlite3_finalize(enter_);
     sqlite3_finalize(leave_);
     if (database_) sqlite3_close(database_);
@@ -398,8 +430,9 @@ void TraceStore::Flush()
     if (pending_)
     {
         FlushInputBlocks();
-        Statement totals(database_, "UPDATE session SET total_calls=?");
-        totals.Exec(count_);
+        SqlCheck(sqlite3_bind_int64(updateTotals_, 1, static_cast<sqlite3_int64>(count_)), database_);
+        SqlCheck(sqlite3_step(updateTotals_), database_);
+        SqlCheck(sqlite3_reset(updateTotals_), database_);
         Execute("COMMIT");
         pending_ = 0;
     }
@@ -603,9 +636,16 @@ void TraceStore::Add(int64_t target, const RecordView& record)
         metadata.layout[std::size(metadata.layout) - 1] = 0;
         if (metadata.category >= ApiCategory::Count) throw std::runtime_error("Invalid API category.");
         Begin();
-        Statement api(database_, "INSERT OR IGNORE INTO apis VALUES(?,?,?,?,?,?,?)");
-        api.Exec(target, static_cast<int>(event.api), metadata.module, metadata.name, Utf8(metadata.parameters),
-            std::min(metadata.argumentCount, MaximumArguments), static_cast<int>(metadata.category));
+        auto parameters = Utf8(metadata.parameters);
+        sqlite3_bind_int64(insertApi_, 1, target);
+        sqlite3_bind_int(insertApi_, 2, static_cast<int>(event.api));
+        sqlite3_bind_text(insertApi_, 3, metadata.module, -1, SQLITE_STATIC);
+        sqlite3_bind_text(insertApi_, 4, metadata.name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(insertApi_, 5, parameters.c_str(), static_cast<int>(parameters.size()), SQLITE_STATIC);
+        sqlite3_bind_int(insertApi_, 6, static_cast<int>(std::min(metadata.argumentCount, MaximumArguments)));
+        sqlite3_bind_int(insertApi_, 7, static_cast<int>(metadata.category));
+        SqlCheck(sqlite3_step(insertApi_), database_);
+        SqlCheck(sqlite3_reset(insertApi_), database_);
         if (metadata.layout[0])
         {
             Statement layout(database_, "INSERT OR IGNORE INTO api_layouts VALUES(?,?,?)");
@@ -668,7 +708,6 @@ void TraceStore::Add(int64_t target, const RecordView& record)
         else sqlite3_bind_null(statement, 8);
         SqlCheck(sqlite3_step(statement), database_);
         SqlCheck(sqlite3_reset(statement), database_);
-        SqlCheck(sqlite3_clear_bindings(statement), database_);
     }
     // Bound transaction size without forcing a commit for every queue batch.
     if (pending_ >= MaxPendingTransactionOps) Flush();
@@ -737,9 +776,9 @@ sqlite3_int64 TraceStore::InputBlockId(const std::byte* data)
     return block.id;
 }
 
-void TraceStore::BindInputBlocks(std::span<const std::byte> input)
+bool TraceStore::BindInputBlocks(std::span<const std::byte> input)
 {
-    if (input.size() < InputBlockBytes) return;
+    if (input.size() < InputBlockBytes) return false;
 
     // A negative range selects literal bytes. Zero fills a range, and a positive ID selects a dictionary block.
     inputParts_ = "[";
@@ -777,14 +816,15 @@ void TraceStore::BindInputBlocks(std::span<const std::byte> input)
         next = id ? id + 1 : 0;
         firstLiteral = offset + InputBlockBytes;
     }
-    if (!rangeBytes) return;
+    if (!rangeBytes) return false;
     appendShared();
     appendLiteral(input.size());
     inputParts_.back() = ']';
-    if (inputParts_.size() + inputLiterals_.size() >= input.size()) return;
+    if (inputParts_.size() + inputLiterals_.size() >= input.size()) return false;
     SqlCheck(sqlite3_bind_blob64(enter_, 18, inputLiterals_.data(), inputLiterals_.size(), SQLITE_STATIC), database_);
     SqlCheck(sqlite3_bind_text64(enter_, 19, inputParts_.data(), inputParts_.size(), SQLITE_STATIC, SQLITE_UTF8),
         database_);
+    return true;
 }
 
 void TraceStore::WriteEntry(int64_t target, const RecordView& entry, const RecordView* leaving)
@@ -794,8 +834,10 @@ void TraceStore::WriteEntry(int64_t target, const RecordView& entry, const Recor
     uint64_t threadKey = (static_cast<uint64_t>(target) << 32) | event.threadId;
     if (!threads_.contains(threadKey))
     {
-        Statement thread(database_, "INSERT OR IGNORE INTO threads VALUES(?,?)");
-        thread.Exec(target, event.threadId);
+        sqlite3_bind_int64(insertThread_, 1, target);
+        sqlite3_bind_int64(insertThread_, 2, event.threadId);
+        SqlCheck(sqlite3_step(insertThread_), database_);
+        SqlCheck(sqlite3_reset(insertThread_), database_);
         if (threads_.size() < 65536) threads_.insert(threadKey);
     }
     auto statement = enter_;
@@ -817,20 +859,32 @@ void TraceStore::WriteEntry(int64_t target, const RecordView& entry, const Recor
     sqlite3_bind_blob(statement, 9, event.arguments, static_cast<int>(argumentCount * sizeof(uint64_t)), SQLITE_STATIC);
     sqlite3_bind_int(statement, 10, leaving ? leaving->event.flags : event.flags);
     sqlite3_bind_blob64(statement, 11, entry.payload.data(), entry.payload.size(), SQLITE_STATIC);
-    BindInputBlocks(entry.payload);
+    if (!BindInputBlocks(entry.payload))
+    {
+        sqlite3_bind_null(statement, 18);
+        sqlite3_bind_null(statement, 19);
+    }
     sqlite3_bind_int64(statement, 16, static_cast<sqlite3_int64>(event.moduleEpoch));
     if (leaving)
     {
         sqlite3_bind_int64(statement, 12, leaving->event.timestamp);
         if (leaving->event.flags & DurationMeasured)
             sqlite3_bind_int64(statement, 17, leaving->event.adjustedDuration);
+        else sqlite3_bind_null(statement, 17);
         sqlite3_bind_int64(statement, 13, leaving->event.result);
         sqlite3_bind_int(statement, 14, leaving->event.error);
         sqlite3_bind_blob64(statement, 15, leaving->payload.data(), leaving->payload.size(), SQLITE_STATIC);
     }
+    else
+    {
+        sqlite3_bind_null(statement, 12);
+        sqlite3_bind_null(statement, 13);
+        sqlite3_bind_null(statement, 14);
+        sqlite3_bind_null(statement, 15);
+        sqlite3_bind_null(statement, 17);
+    }
     SqlCheck(sqlite3_step(statement), database_);
     SqlCheck(sqlite3_reset(statement), database_);
-    SqlCheck(sqlite3_clear_bindings(statement), database_);
 }
 
 std::wstring ColumnText(sqlite3_stmt* statement, int column)
