@@ -19,6 +19,9 @@ struct InstructionChannel
     void Publish(Slot* slot);
     SharedHeader* Header() const { return header; }
     const CatalogView& Catalog() const { return catalog; }
-    static std::byte* Payload(Slot* slot) { return reinterpret_cast<std::byte*>(slot) + sizeof(Slot); }
+    static std::byte* Payload(Slot* slot)
+    {
+        return reinterpret_cast<std::byte*>(slot) + sizeof(Slot) + slot->bufferDelta + slot->payloadOffset;
+    }
 };
 }

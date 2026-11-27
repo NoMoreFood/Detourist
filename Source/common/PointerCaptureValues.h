@@ -1,5 +1,6 @@
 #pragma once
 #include "CaptureValues.h"
+#include "TransportPool.h"
 #include <algorithm>
 #include <cstring>
 #include <optional>
@@ -36,7 +37,7 @@ __forceinline void CaptureRecordReference(Slot* slot, SharedHeader* header, uint
 inline uint32_t CaptureTerminatedPointers(Slot* slot, SharedHeader* header, uint32_t parameter,
     uint64_t address, uint32_t flags)
 {
-    auto available = header->payloadCapacity - slot->event.payloadBytes;
+    auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + header->bufferLimit);
     if (available < sizeof(Value)) return 0;
     auto maximum = std::min<uint32_t>(header->bufferLimit, available - sizeof(Value));
     uint64_t bytes = 0;

@@ -78,6 +78,7 @@ public sealed class CaptureSettings
     public string[] SymbolDirectories { get; set; } = [];
     public bool FollowChildren { get; set; } = true;
     public bool InstructionEngine { get; set; } = true;
+    public bool RawPointerProbes { get; set; }
     public bool FromAppOnCapture { get; set; }
     public string[] ExcludedApis { get; set; } = [];
     [JsonIgnore] public NoiseProfileInfo[] NoiseProfiles { get; set; } = [];

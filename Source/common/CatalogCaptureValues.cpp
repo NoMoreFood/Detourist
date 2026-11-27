@@ -228,7 +228,7 @@ void CaptureEtwDescriptors(Slot* slot, SharedHeader* header, uint32_t parameter,
     for (uint32_t index = 0; index < std::min(captured / 16, format == 3 ? 16u : UINT32_MAX); ++index)
     {
         auto member = index * 16;
-        if (member >= ValueMemberMaxOffset || header->payloadCapacity - slot->event.payloadBytes < sizeof(Value)) return;
+        if (member >= ValueMemberMaxOffset || SlotMaxRemaining(slot, header) < sizeof(Value)) return;
         auto record = Transport::Payload(slot) + snapshot + sizeof(Value) + member;
         CaptureRecordReference(slot, header, PackMemberParameter(parameter, member), record,
             0, 8, ValueKind::Bytes, flags | MemberData | ReferencedData, 8);

@@ -1,5 +1,6 @@
 #pragma once
 #include "CaptureValues.h"
+#include "TransportPool.h"
 #include <algorithm>
 #include <authz.h>
 #include <cstring>
@@ -13,7 +14,7 @@ void CaptureAuthzOperations(State& call, Slot* slot, bool leaving, uint32_t inde
     if (leaving || !(parameter.flags & ExportInput) || index >= MaximumArguments) return;
     auto header = call.transport->Header();
     auto snapshot = slot->event.payloadBytes;
-    if (snapshot > header->payloadCapacity || header->payloadCapacity - snapshot < sizeof(Value)) return;
+    if (EnsureSlotPayload(slot, header, sizeof(Value) + sizeof(uint32_t)) < sizeof(Value)) return;
     auto address = call.event.arguments[index];
 
     // Retain the first enum before following a context or attempting a larger array snapshot.
@@ -45,7 +46,8 @@ void CaptureAuthzOperations(State& call, Slot* slot, bool leaving, uint32_t inde
     // The global and remaining payload limits bound reads while preserving the full logical array size.
     auto bytes = uint64_t{count} * sizeof(operation);
     auto limit = std::min<uint64_t>(bytes, header->bufferLimit);
-    limit = std::min<uint64_t>(limit, header->payloadCapacity - snapshot - sizeof(Value));
+    const auto maxRemaining = header->payloadCapacity - slot->payloadOffset - snapshot - sizeof(Value);
+    limit = std::min<uint64_t>(limit, maxRemaining);
     if (limit && address > UINTPTR_MAX - (limit - 1)) return;
     slot->event.payloadBytes = snapshot;
     CopyValue(slot, header, index, ValueKind::Bytes, address, bytes, {.guarded = true});

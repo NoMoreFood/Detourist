@@ -19,9 +19,10 @@ uintptr_t NativeImageStart = 0;
 uintptr_t NativeImageEnd = 0;
 DWORD NativeThreadStatus() { return static_cast<DWORD>(NtCurrentTeb()->LastStatusValue); }
 void RestoreNativeThreadStatus(DWORD status) { NtCurrentTeb()->LastStatusValue = static_cast<NTSTATUS>(status); }
+DWORD CurrentObserverThreadId() noexcept { return HandleToUlong(NtCurrentTeb()->ClientId.UniqueThread); }
 bool NativeThreadReady()
 {
-    if (ProcessShuttingDown) return false;
+    if (ProcessShuttingDown || IsObserverThreadDetached()) return false;
     // Loader syscalls can precede this DLL's TLS allocation on a newly created thread.
     auto slots = reinterpret_cast<void**>(NtCurrentTeb()->ThreadLocalStoragePointer);
     return slots && slots[_tls_index];

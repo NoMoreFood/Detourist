@@ -682,7 +682,7 @@ uint32_t CaptureRuntimeTraceMessage(InstructionFrame& call, Slot* slot, bool lea
     auto address = listed ? call.event.arguments[4] : call.stackPointer + start;
     if (!address) return recognized;
     auto header = call.transport->Header();
-    auto available = header->payloadCapacity - slot->event.payloadBytes;
+    auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + header->bufferLimit);
     if (available < sizeof(Value)) return recognized;
     const auto limit = std::min(header->bufferLimit, available - static_cast<uint32_t>(sizeof(Value)));
     uint32_t bytes = 0;

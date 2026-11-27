@@ -1422,7 +1422,8 @@ void UnknownSyscalls(SyscallCapture& capture)
         uint32_t limit = scenario ? 64 : 16;
         auto output = context.directory / L"unknown.bin";
         capture.Start(L"--unknown-services " + Quote(output), mask, limit, true,
-                      {{"excludedApis", scenario == 2 ? Json::array({names[0]}) : Json::array()}});
+                      {{"rawPointerProbes", true},
+                       {"excludedApis", scenario == 2 ? Json::array({names[0]}) : Json::array()}});
         capture.Finish();
         Require(SyscallFile(output) == results, "Sparse syscall native results differ");
         for (auto name : names)

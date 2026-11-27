@@ -3,6 +3,7 @@
 #include <phnt.h>
 #pragma warning(pop)
 #include "CaptureValues.h"
+#include "TransportPool.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -214,13 +215,13 @@ uint32_t CopyValue(Slot* slot, SharedHeader* header, uint32_t parameter, ValueKi
     uint64_t address, uint64_t length, ValueCopyOptions options)
 {
     if (!address) return 0;
-    auto available = header->payloadCapacity - slot->event.payloadBytes;
+    uint32_t limit = kind == ValueKind::Stack ? MaximumStack * sizeof(uint64_t) : header->bufferLimit;
+    uint32_t desired = static_cast<uint32_t>(std::min<uint64_t>(length, limit));
+    auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + desired);
     if (available < sizeof(Value)) return 0;
     auto output = Transport::Payload(slot) + slot->event.payloadBytes;
     Value value{parameter, kind, options.flags, 0, length};
-    uint32_t limit = kind == ValueKind::Stack ? MaximumStack * sizeof(uint64_t) : header->bufferLimit;
-    uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(length, limit));
-    count = std::min(count, available - static_cast<uint32_t>(sizeof(Value)));
+    uint32_t count = std::min(desired, available - static_cast<uint32_t>(sizeof(Value)));
 
     // Read only the requested bounded memory while it belongs to this invocation.
     if (options.terminated)

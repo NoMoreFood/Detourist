@@ -5,6 +5,7 @@
 namespace Detourist
 {
 struct CaptureClock;
+struct Slot;
 inline constexpr uint32_t NativeHookCapacity = 16384;
 inline constexpr uint32_t InternalNativeImageCount = 7;
 enum ObserverFlags : uint32_t { ObserverRecording = 1, ObserverFollowingChild = 2, ObserverNativeReady = 4 };
@@ -29,5 +30,7 @@ struct ObserverThreadPointers
     bool* followingChild = nullptr;
     CaptureClock* clock = nullptr;
     volatile LONG* processShuttingDown = nullptr;
+    Slot** pendingSlot = nullptr;
+    void** pendingTransport = nullptr;
 };
 }

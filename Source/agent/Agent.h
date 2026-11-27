@@ -21,6 +21,9 @@ extern volatile LONG ManagedProfilerState;
 [[msvc::no_tls_guard]] extern constinit thread_local uint64_t CallIdentity;
 [[msvc::no_tls_guard]] extern constinit thread_local bool FollowingChild;
 [[msvc::no_tls_guard]] extern constinit thread_local CaptureClock CaptureTime;
+[[msvc::no_tls_guard]] extern constinit thread_local Slot* PendingEntrySlot;
+[[msvc::no_tls_guard]] extern constinit thread_local Transport* PendingEntryTransport;
+void FlushPendingEntrySlot() noexcept;
 extern uint32_t InstalledNativeCount;
 extern uint32_t AvailableNativeCount;
 extern uint32_t NativeExportCount;
@@ -35,6 +38,7 @@ extern bool BroadHooks;
 struct Call
 {
     Transport* transport = nullptr;
+    Slot* deferredSlot = nullptr;
     const CatalogPlan* exportPlan = nullptr;
     RpcCaptureState* rpc = nullptr;
     uint64_t returnBuffer = 0;
@@ -153,7 +157,10 @@ void AddStackHooks(std::vector<HookDefinition>& hooks);
 bool IsStackHook(void* observer);
 void CaptureCallStack(Call& call, Slot* slot);
 void InvalidateStackImageCache() noexcept;
+DWORD CurrentObserverThreadId() noexcept;
+void AttachObserverThread() noexcept;
 void DetachObserverThread() noexcept;
+bool IsObserverThreadDetached() noexcept;
 
 struct ExportCallInfo
 {

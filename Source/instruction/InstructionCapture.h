@@ -118,12 +118,14 @@ struct InstructionDefinition
     void* volatile rttiLocator;
     volatile LONG published, queryProbe, sharedComAddress, sharedExport, wrapped;
     bool known, interfaceWrapPending, retired, continuation, coverageCounted, entryOnly, provisional, ambiguousExport,
-        stackProbe, optionalMode, callbackRegistration, wglLookup, nativeImportAlias, rpcProxy;
+        stackProbe, optionalMode, callbackRegistration, wglLookup, nativeImportAlias, rpcProxy,
+        alwaysWrap, wrapFailed, superseded, blockingCall;
 };
 
 struct InstructionFrame
 {
     InstructionChannel* transport;
+    Slot* deferredSlot;
     Event event;
     CaptureClock* clock;
     int64_t invocationStarted;
@@ -172,6 +174,7 @@ struct InstructionThread
     CaptureClock clock;
     ObserverThreadPointers observer;
     bool observerBound, observerDetached;
+    Slot* pendingSlot;
     InstructionFrames* blocks;
     InstructionFrame* freeFrames;
     InstructionFrame* current;
@@ -180,6 +183,21 @@ struct InstructionThread
     uint64_t comInstance, comCaller;
     uint32_t comSlot;
 };
+
+inline CaptureClock* ValidFrameClock(InstructionThread* thread, CaptureClock* clock) noexcept
+{
+    if (!clock || !thread) return nullptr;
+    if (clock == &thread->clock) return clock;
+    if (!thread->observerBound || thread->observerDetached || !thread->observer.slotGeneration ||
+        thread->observer.slotGeneration->load(std::memory_order_acquire) != thread->observer.expectedGeneration ||
+        (thread->observer.processShuttingDown && *thread->observer.processShuttingDown))
+    {
+        thread->observerBound = false;
+        thread->observerDetached = true;
+        return nullptr;
+    }
+    return clock;
+}
 
 ExportSignature PublicSignature(Api api);
 ExportSignature SignatureFor(Api api);
@@ -242,7 +260,10 @@ InstructionDefinition* ResolveInterfaceDefinition(InstructionDefinition* definit
     uint32_t slot = UINT32_MAX);
 bool ExportFailure(const InstructionDefinition& definition, uint64_t result);
 bool InstructionFailure(Api api, uint64_t result);
-void PublishInstruction(InstructionFrame& call, bool leaving);
+bool IsBlockingExportName(const char* name, Api typed);
+void FlushThreadPendingSlots(void* context, InstructionThread& thread);
+void SyncExportWraps();
+void PublishInstruction(InstructionFrame& call, bool leaving, bool allowDefer = true);
 void PublishDefinition(InstructionDefinition& definition);
 void CopyDescription(wchar_t* output, size_t capacity, const wchar_t* text);
 Api FindExportType(const char* module, const char* name);
@@ -278,6 +299,8 @@ bool WriteInstructionArgument(void* wrapped, dr_mcontext_t& machine, const Expor
 uint64_t PrepareAsyncCallback(void* context, InstructionFrame& frame, uint32_t& parameter);
 extern InstructionChannel InstructionTransport;
 extern void* DefinitionLock;
+extern void* WrapSyncLock;
+extern volatile LONGLONG AppliedWrapGeneration;
 extern volatile LONG ObservedComActive;
 extern volatile LONG64* NativeStackImageEpoch;
 extern int ThreadSlot;

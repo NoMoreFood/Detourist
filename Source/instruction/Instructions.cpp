@@ -8,7 +8,9 @@
 #pragma warning(push, 0)
 #include "drwrap.h"
 #pragma warning(pop)
+#include "TransportPool.h"
 #include <atomic>
+#include <utility>
 
 namespace Detourist
 {
@@ -37,6 +39,8 @@ struct ExtendedSyscall
 std::array<std::atomic<ExtendedSyscall*>, ExtendedSyscallBuckets> ExtendedSyscalls{};
 uint32_t NextExtendedSyscallApi = SyscallApiStart + static_cast<uint32_t>(InstructionDefinitions.size());
 void* DefinitionLock = nullptr;
+void* WrapSyncLock = nullptr;
+volatile LONGLONG AppliedWrapGeneration = 0;
 int ThreadSlot = -1;
 int SyscallSlot = -1;
 uintptr_t NtdllStart = 0, NtdllEnd = 0, Win32uStart = 0, Win32uEnd = 0;
@@ -138,6 +142,7 @@ InstructionDefinition* DefinitionFor(int number)
         definition->nameHash = ApiNameHash(definition->metadata.name);
         definition->asyncRole = AsyncRole(definition->metadata.module, definition->metadata.name);
         definition->sourceNameHash = *name ? ApiNameHash(name) : definition->nameHash;
+        definition->blockingCall = IsBlockingExportName(*name ? name : definition->metadata.name, definition->typed);
         PublishDefinition(*definition);
         value = definition;
         if (normal) InstructionDefinitions[service].store(value, std::memory_order_release);
@@ -210,27 +215,48 @@ void PublishDefinition(InstructionDefinition& definition)
     }
 }
 
-void PublishInstruction(InstructionFrame& call, bool leaving)
+void PublishInstruction(InstructionFrame& call, bool leaving, bool allowDefer)
 {
-    auto slot = call.transport->Acquire();
-    if (!slot) return;
-    slot->event = call.event;
-    slot->event.kind = leaving ? EventKind::Leave : EventKind::Enter;
-    slot->event.timestamp = !leaving && call.queryTimestamp ? call.queryTimestamp : Clock();
-    slot->event.payloadBytes = 0;
+    auto header = call.transport->Header();
+    auto context = dr_get_current_drcontext();
+    auto thread = context ? static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot)) : nullptr;
+    Slot* slot = nullptr;
+    bool fused = false;
+    if (leaving && thread && call.deferredSlot && thread->pendingSlot == call.deferredSlot)
+    {
+        slot = std::exchange(thread->pendingSlot, nullptr);
+        fused = true;
+        const auto savedEpoch = slot->event.moduleEpoch;
+        slot->inputBytes = slot->event.payloadBytes;
+        slot->payloadOffset = slot->inputBytes;
+        slot->event = call.event;
+        slot->event.moduleEpoch = savedEpoch;
+        slot->event.kind = EventKind::Completed;
+        slot->event.timestamp = Clock();
+        slot->event.payloadBytes = 0;
+    }
+    else
+    {
+        slot = call.transport->Acquire();
+        if (!slot) return;
+        slot->event = call.event;
+        slot->event.kind = leaving ? EventKind::Leave : EventKind::Enter;
+        slot->event.timestamp = !leaving && call.queryTimestamp ? call.queryTimestamp : Clock();
+        slot->event.payloadBytes = 0;
+    }
     // Pending operations have no completed output buffers to publish.
     if (!(call.event.flags & Unwound) && !(leaving && (call.event.flags & AsyncPending)))
     {
         auto api = call.definition->typed;
         if (call.definition->marshalOperation)
-            CaptureRpcMarshalValues(call.event, slot, call.transport->Header(), call.definition->marshalOperation,
+            CaptureRpcMarshalValues(call.event, slot, header, call.definition->marshalOperation,
                 static_cast<uint32_t>(InterlockedCompareExchange(&call.definition->marshalBytes, 0, 0)), leaving);
         else if (call.definition->runtime && call.definition->runtime->IsAviSave())
             CaptureRuntimeAviSave(call, slot, leaving);
         else if (call.definition->runtime && call.definition->runtime->IsAuthzAudit())
             CaptureRuntimeAuthzAudit(call, slot, leaving);
         else if (call.rpc.decoder != RpcDecoder::None)
-            CaptureRpcValues(call.rpc, call.event, slot, call.transport->Header(), leaving);
+            CaptureRpcValues(call.rpc, call.event, slot, header, leaving);
         else if (call.definition->runtime)
         {
             // Complete formatter contracts avoid unused tail probes and broad argument-list storage reads.
@@ -253,20 +279,19 @@ void PublishInstruction(InstructionFrame& call, bool leaving)
                     if (recognized & (uint32_t{1} << index)) continue;
                     auto address = call.event.arguments[index];
                     if (address >= MinimumUserAddress && address < MaximumUserAddress)
-                        CopyValue(slot, call.transport->Header(), index, ValueKind::Bytes,
-                            address, call.transport->Header()->bufferLimit);
+                        CopyValue(slot, header, index, ValueKind::Bytes, address, header->bufferLimit);
                 }
             }
         }
         else if (!call.definition->known)
         {
-            for (uint32_t index = 0; index < call.definition->metadata.argumentCount; ++index)
-            {
-                auto address = call.event.arguments[index];
-                if (address >= MinimumUserAddress && address < MaximumUserAddress)
-                    CopyValue(slot, call.transport->Header(), index, ValueKind::Bytes,
-                        address, call.transport->Header()->bufferLimit);
-            }
+            if (header->rawPointerProbes || call.definition->interfaceTable || call.definition->ambiguousExport)
+                for (uint32_t index = 0; index < call.definition->metadata.argumentCount; ++index)
+                {
+                    auto address = call.event.arguments[index];
+                    if (address >= MinimumUserAddress && address < MaximumUserAddress)
+                        CopyValue(slot, header, index, ValueKind::Bytes, address, header->bufferLimit);
+                }
         }
         else if (IsComApi(api)) CaptureInstructionCom(call, slot, leaving);
         else if ((!IsNativeApi(api) && !IsWin32uApi(api))) CapturePublicParameters(call, slot, leaving);
@@ -275,7 +300,7 @@ void PublishInstruction(InstructionFrame& call, bool leaving)
     if (!leaving && call.stackCount)
     {
         const auto position = slot->event.payloadBytes;
-        CopyValue(slot, call.transport->Header(), UINT32_MAX, ValueKind::Stack,
+        CopyValue(slot, header, UINT32_MAX, ValueKind::Stack,
             reinterpret_cast<uint64_t>(call.stack), call.stackCount * sizeof(uint64_t));
         if (slot->event.payloadBytes > position)
         {
@@ -286,17 +311,40 @@ void PublishInstruction(InstructionFrame& call, bool leaving)
         else call.event.flags |= StackUnavailable;
         slot->event.flags = call.event.flags;
     }
+    if (!leaving && allowDefer && thread && !slot->overflowIndex &&
+        !(call.event.flags & (Skipped | Continuation | KernelDispatcher)) &&
+        !call.definition->entryOnly && !call.definition->continuation && !call.definition->blockingCall &&
+        !call.queryProbe && !call.nativeBoundary && !call.child &&
+        call.asyncRole == AsyncIoRole::None && call.rpc.decoder == RpcDecoder::None &&
+        !header->debuggerActive && !header->entryBreaks && !header->exitBreaks &&
+        header->entryApi < 0 && header->exitApi < 0 && !CreatesChild(call.definition->typed))
+    {
+        if (auto previous = std::exchange(thread->pendingSlot, nullptr))
+            call.transport->Publish(previous);
+        StampSlotModuleEpoch(header, slot);
+        slot->entryTimestamp = slot->event.timestamp;
+        call.deferredSlot = slot;
+        thread->pendingSlot = slot;
+        return;
+    }
+    if (fused)
+    {
+        slot->event.payloadBytes += slot->inputBytes;
+        slot->payloadOffset = 0;
+    }
     call.transport->Publish(slot);
 }
 
 void UnwindSyscalls(InstructionSyscalls& syscalls, uint32_t depth, bool measureDuration = true)
 {
+    auto context = measureDuration ? dr_get_current_drcontext() : nullptr;
+    auto thread = context ? static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot)) : nullptr;
     for (uint32_t index = depth; index < syscalls.depth; ++index)
     {
         auto& frame = syscalls.frames[index];
         if (frame.suspended) --syscalls.suspended;
         if (!frame.counted) continue;
-        CaptureObservation capture(measureDuration ? frame.clock : nullptr, Clock());
+        CaptureObservation capture(measureDuration ? ValidFrameClock(thread, frame.clock) : nullptr, Clock());
         if (capture.clock)
         {
             frame.event.adjustedDuration = std::max(int64_t{0}, capture.ApplicationTime() - frame.invocationStarted);
@@ -343,7 +391,7 @@ bool PublishNativeBoundary(InstructionFrame& frame, bool leaving)
 
     // The boundary shares the syscall's event, so its own edit and skip markers persist from entry to return.
     frame.nativeFlags |= frame.event.flags & (Edited | Skipped);
-    if (frame.record) PublishInstruction(frame, leaving);
+    if (frame.record) PublishInstruction(frame, leaving, false);
     event.result = frame.event.result;
     event.error = frame.event.error;
     memcpy(event.arguments, frame.event.arguments, sizeof(event.arguments));
@@ -381,6 +429,7 @@ bool PreSyscall(void* context, int number)
         SyscallContinuations[number];
     if (continuation) frame.event.flags = Continuation;
     auto header = InstructionTransport.Header();
+    if (ReadShared64(header->wrapGeneration) != ReadShared64(AppliedWrapGeneration)) SyncExportWraps();
     auto threadId = dr_get_thread_id(context);
     auto asyncRole = number >= 0 && number < static_cast<int>(std::size(SyscallNames)) ?
         SyscallAsyncRoles[number] : AsyncIoRole::None;
@@ -469,6 +518,7 @@ bool PreSyscall(void* context, int number)
     bool nativeBreaks = native && (((header->entryBreaks | header->exitBreaks) & Win32uApis) ||
         header->entryApi == static_cast<LONG>(boundary->id) || header->exitApi == static_cast<LONG>(boundary->id));
     if (!record && !child && !breaks && !nativeRecord && !nativeBreaks && !asyncObserver) return true;
+    FlushThreadPendingSlots(context, *thread);
 
     // Keep invocation state in runtime-owned memory, independent of the target's allocator and thread locals.
     frame.transport = &InstructionTransport;
@@ -574,7 +624,7 @@ bool PreSyscall(void* context, int number)
         auto callback = PrepareAsyncCallback(context, frame, parameter);
         if (callback) dr_syscall_set_param(context, static_cast<int>(parameter), static_cast<reg_t>(callback));
     }
-    if (record) PublishInstruction(frame, false);
+    if (record) PublishInstruction(frame, false, !skip);
     if (record && !skip) BeginAsyncIo(header, frame.event, asyncRole);
     if (skip)
     {
@@ -594,7 +644,8 @@ bool PreSyscall(void* context, int number)
 void CompleteSyscall(void* context, InstructionFrame& frame, dr_mcontext_t* resumed = nullptr)
 {
     if (!frame.active) return;
-    CaptureObservation capture(frame.clock, Clock());
+    auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
+    CaptureObservation capture(ValidFrameClock(thread, frame.clock), Clock());
     if (capture.clock)
     {
         frame.event.adjustedDuration = std::max(int64_t{0}, capture.ApplicationTime() - frame.invocationStarted);
@@ -657,6 +708,8 @@ void PostSyscall(void* context, int number)
 void SyscallInterrupted(void* context, const dr_kernel_xfer_info_t* transfer)
 {
     if (transfer->type != DR_XFER_APC_DISPATCHER || !transfer->source_mcontext) return;
+    if (auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot)))
+        FlushThreadPendingSlots(context, *thread);
     auto syscalls = static_cast<InstructionSyscalls*>(drmgr_get_cls_field(context, SyscallSlot));
     if (!syscalls) return;
     auto& source = *transfer->source_mcontext;
@@ -1010,6 +1063,7 @@ void InstructionExit()
     FreeInstructionImports();
     FreeCaptureCatalog();
     drmgr_exit();
+    dr_mutex_destroy(WrapSyncLock);
     dr_mutex_destroy(DefinitionLock);
     InstructionTransport.Close();
 }
@@ -1028,6 +1082,7 @@ DR_EXPORT void dr_client_main(client_id_t, int argc, const char* argv[])
     }
     auto header = InstructionTransport.Header();
     DefinitionLock = dr_mutex_create();
+    WrapSyncLock = dr_mutex_create();
     ResetMruCapture(header->captureIdentity);
     if (!drmgr_init() || !drwrap_init())
     {

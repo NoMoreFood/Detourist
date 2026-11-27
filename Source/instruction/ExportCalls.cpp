@@ -85,6 +85,7 @@ void ExportEntered(void* wrapped, void** state)
     auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
     auto header = InstructionTransport.Header();
     auto threadId = dr_get_thread_id(context);
+    if (ReadShared64(header->wrapGeneration) != ReadShared64(AppliedWrapGeneration)) SyncExportWraps();
     bool mruLifetime = definition->typed == Api::CreateMRUListW || definition->typed == Api::FreeMRUList;
     bool moduleInitialization = !strcmp(definition->metadata.name, "DllMain");
     bool mruOnly = header->capturePaused != 0;
@@ -138,6 +139,7 @@ void ExportEntered(void* wrapped, void** state)
         definition->typed == Api::CoGetInstanceFromIStorage ||
         definition->signature.interfaceOutputIndex ||
         definition->interfaceInputs ||
+        PublicInterfaceOutputs(definition->typed) ||
         (definition->runtime && (definition->runtime->interfaceParameters ||
             definition->runtime->resultInterfaceIndex)));
     bool breaks = !mruOnly && !native && !queryProbe &&
@@ -164,6 +166,7 @@ void ExportEntered(void* wrapped, void** state)
     if (!machine) return;
     auto frame = TakeExportFrame(context, *thread);
     if (!frame) return;
+    FlushThreadPendingSlots(context, *thread);
     frame->transport = &InstructionTransport;
     frame->clock = capture.clock;
     frame->invocationStarted = capture.ApplicationTime();
@@ -356,7 +359,7 @@ void ExportEntered(void* wrapped, void** state)
         auto callback = PrepareAsyncCallback(context, *frame, parameter);
         if (callback) drwrap_set_arg(wrapped, static_cast<int>(parameter), reinterpret_cast<void*>(callback));
     }
-    if (record) PublishInstruction(*frame, false);
+    if (record) PublishInstruction(*frame, false, !skip);
     if (record && !skip) BeginAsyncIo(header, frame->event, asyncRole);
     if (discover && !skip) DiscoverInstructionInputs(*frame);
     if (definition->entryOnly)
@@ -407,15 +410,15 @@ void ExportLeft(void* wrapped, void* state)
     [[maybe_unused]] X86FloatingState floating;
     auto frame = static_cast<InstructionFrame*>(state);
     if (!frame || !frame->active) return;
-    CaptureObservation capture(frame->clock, Clock());
+    auto context = wrapped ? drwrap_get_drcontext(wrapped) : dr_get_current_drcontext();
+    auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
+    if (!thread) return;
+    CaptureObservation capture(ValidFrameClock(thread, frame->clock), Clock());
     if (capture.clock)
     {
         frame->event.adjustedDuration = std::max(int64_t{0}, capture.ApplicationTime() - frame->invocationStarted);
         frame->event.flags |= DurationMeasured;
     }
-    auto context = wrapped ? drwrap_get_drcontext(wrapped) : dr_get_current_drcontext();
-    auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot));
-    if (!thread) return;
     if (!wrapped) frame->event.flags |= Unwound;
     else
     {
@@ -446,7 +449,7 @@ void ExportLeft(void* wrapped, void* state)
             {
                 auto error = frame->event.error;
                 frame->event.error = frame->queryError;
-                PublishInstruction(*frame, false);
+                PublishInstruction(*frame, false, false);
                 frame->event.error = error;
             }
         }
@@ -515,6 +518,7 @@ void EndExportThread(void* context, InstructionThread& thread)
         }
         if (frame->counted) InterlockedDecrement64(&InstructionTransport.Header()->activeCalls);
     }
+    FlushThreadPendingSlots(context, thread);
     while (thread.blocks)
     {
         auto block = thread.blocks;

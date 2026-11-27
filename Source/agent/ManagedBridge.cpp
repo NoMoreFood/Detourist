@@ -1,5 +1,6 @@
 #include "Agent.h"
 #include "ProfilerBridge.h"
+#include "TransportPool.h"
 #include <algorithm>
 #include <memory>
 #include <new>
@@ -22,29 +23,85 @@ struct ManagedDefinition
 
 constexpr size_t ManagedDefinitionCapacity = 65536;
 constexpr size_t BoundObserverSlotCapacity = 4096;
+constexpr size_t DetachedThreadTableCapacity = 4096;
+constexpr DWORD DetachedThreadTombstone = 1;
 constexpr unsigned ManagedPageShift = 12;
 constexpr size_t ManagedCodePageCount = size_t{1} << (32 - ManagedPageShift);
 
 SRWLOCK ManagedDefinitionsLock = SRWLOCK_INIT;
 std::array<std::atomic<ManagedDefinition*>, ManagedDefinitionCapacity> ManagedDefinitions{};
 std::array<std::atomic<uint64_t>, BoundObserverSlotCapacity> BoundObserverGenerations{};
+std::array<std::atomic<DWORD>, DetachedThreadTableCapacity> DetachedObserverThreads{};
 std::atomic<uint64_t> NextBoundObserverGeneration = 1;
 [[msvc::no_tls_guard]] constinit thread_local uint32_t BoundObserverSlot = 0;
 [[msvc::no_tls_guard]] constinit thread_local uint64_t BoundObserverGeneration = 0;
-[[msvc::no_tls_guard]] constinit thread_local bool ObserverThreadDetached = false;
 uint32_t ManagedDefinitionCount = 0;
 volatile LONG ManagedProfilerState = static_cast<LONG>(ManagedState::Inactive);
 void WINAPI ManagedStatus(uint32_t state);
 
+bool IsObserverThreadDetached() noexcept
+{
+    const auto tid = CurrentObserverThreadId();
+    if (tid <= DetachedThreadTombstone) return false;
+    const auto start = static_cast<size_t>(tid * 2654435761u) & (DetachedThreadTableCapacity - 1);
+    for (size_t step = 0; step < DetachedThreadTableCapacity; ++step)
+    {
+        const auto value = DetachedObserverThreads[(start + step) & (DetachedThreadTableCapacity - 1)]
+            .load(std::memory_order_acquire);
+        if (!value) return false;
+        if (value == tid) return true;
+    }
+    return false;
+}
+
+void AttachObserverThread() noexcept
+{
+    const auto tid = CurrentObserverThreadId();
+    if (tid <= DetachedThreadTombstone) return;
+    const auto start = static_cast<size_t>(tid * 2654435761u) & (DetachedThreadTableCapacity - 1);
+    for (size_t step = 0; step < DetachedThreadTableCapacity; ++step)
+    {
+        auto& slot = DetachedObserverThreads[(start + step) & (DetachedThreadTableCapacity - 1)];
+        auto value = slot.load(std::memory_order_acquire);
+        if (!value) return;
+        if (value == tid) slot.compare_exchange_strong(value, DetachedThreadTombstone, std::memory_order_acq_rel);
+    }
+}
+
 void DetachObserverThread() noexcept
 {
-    if (!NativeThreadReady()) return;
-    ObserverThreadDetached = true;
-    if (!BoundObserverSlot) return;
-    auto expected = BoundObserverGeneration;
-    BoundObserverGenerations[BoundObserverSlot - 1].compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
-    BoundObserverSlot = 0;
-    BoundObserverGeneration = 0;
+    if (NativeThreadReady())
+    {
+        FlushPendingEntrySlot();
+        if (BoundObserverSlot)
+        {
+            auto expected = BoundObserverGeneration;
+            BoundObserverGenerations[BoundObserverSlot - 1].compare_exchange_strong(expected, 0,
+                std::memory_order_acq_rel);
+            BoundObserverSlot = 0;
+            BoundObserverGeneration = 0;
+        }
+    }
+    const auto tid = CurrentObserverThreadId();
+    if (tid <= DetachedThreadTombstone) return;
+    const auto start = static_cast<size_t>(tid * 2654435761u) & (DetachedThreadTableCapacity - 1);
+    size_t tombstoneIndex = DetachedThreadTableCapacity;
+    for (size_t step = 0; step < DetachedThreadTableCapacity; ++step)
+    {
+        const auto index = (start + step) & (DetachedThreadTableCapacity - 1);
+        auto value = DetachedObserverThreads[index].load(std::memory_order_acquire);
+        if (value == tid) return;
+        if (value == DetachedThreadTombstone && tombstoneIndex == DetachedThreadTableCapacity) tombstoneIndex = index;
+        if (!value)
+        {
+            const auto target = tombstoneIndex < DetachedThreadTableCapacity ? tombstoneIndex : index;
+            DWORD expected = tombstoneIndex < DetachedThreadTableCapacity ? DetachedThreadTombstone : 0;
+            if (DetachedObserverThreads[target].compare_exchange_strong(expected, tid, std::memory_order_acq_rel))
+                return;
+        }
+    }
+    if (tombstoneIndex < DetachedThreadTableCapacity)
+        DetachedObserverThreads[tombstoneIndex].store(tid, std::memory_order_release);
 }
 
 #if defined(_M_IX86)
@@ -233,8 +290,11 @@ bool PublishManagedApiMetadata(Api api, Transport* transport)
             {
                 auto part = transport->Acquire();
                 if (!part) { published = false; break; }
-                auto bytes = static_cast<uint32_t>(std::min<size_t>(layout.size() - offset,
+                auto desired = static_cast<uint32_t>(std::min<size_t>(layout.size() - offset,
                     header->payloadCapacity - sizeof(ApiLayoutFragment)));
+                auto available = EnsureSlotPayload(part, header,
+                    static_cast<uint32_t>(sizeof(ApiLayoutFragment)) + desired);
+                auto bytes = std::min(desired, available - static_cast<uint32_t>(sizeof(ApiLayoutFragment)));
                 ApiLayoutFragment fragment{offset, static_cast<uint32_t>(layout.size())};
                 part->event = {};
                 part->event.kind = EventKind::ApiLayout;
@@ -354,7 +414,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI DetouristBindObserverThread(Detouri
 {
     using namespace Detourist;
     static_assert(sizeof(Api) == sizeof(uint32_t));
-    if (!pointers || !NativeThreadReady() || ObserverThreadDetached) return FALSE;
+    if (!pointers || !NativeThreadReady()) return FALSE;
 
     // Guard bound TLS pointers with a pinned slot generation cleared before loader thread-detach frees TLS memory.
     if (BoundObserverSlot &&
@@ -383,7 +443,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI DetouristBindObserverThread(Detouri
     }
     *pointers = {&BoundObserverGenerations[BoundObserverSlot - 1], BoundObserverGeneration,
         &CallIdentity, &ParentCall, &CallDepth, reinterpret_cast<uint32_t*>(&CallApi),
-        &ObserverActive, &FollowingChild, &CaptureTime, &ProcessShuttingDown};
+        &ObserverActive, &FollowingChild, &CaptureTime, &ProcessShuttingDown,
+        &PendingEntrySlot, reinterpret_cast<void**>(&PendingEntryTransport)};
     return TRUE;
 }
 

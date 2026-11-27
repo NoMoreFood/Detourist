@@ -11,7 +11,9 @@ namespace Detourist
 #pragma warning(push)
 #pragma warning(disable: 4995)
 constexpr uint32_t ProtocolMagic = 0x52555444;
-constexpr uint32_t ProtocolVersion = 29;
+constexpr uint32_t ProtocolVersion = 30;
+constexpr uint32_t InlineSlotPayloadBytes = 3712;
+constexpr uint32_t MaximumTransportCapacity = 2048;
 constexpr uint32_t MaximumStack = 48;
 constexpr uint32_t MaximumArguments = 32;
 constexpr uint32_t RawArgumentCount = 20;
@@ -223,7 +225,7 @@ constexpr bool NativeReturnsStatus(Api api)
 
 enum class EventKind : uint32_t
 {
-    Enter = 1, Leave, Child, Diagnostic, ApiMetadata, ApiLayout, ModuleLoad, ModuleUnload, AsyncCompletion
+    Enter = 1, Leave, Child, Diagnostic, ApiMetadata, ApiLayout, ModuleLoad, ModuleUnload, AsyncCompletion, Completed
 };
 struct DynamicApiMetadata
 {
@@ -547,11 +549,16 @@ struct alignas(64) SharedHeader
     uint32_t capacity;
     uint32_t stride;
     uint32_t payloadCapacity;
+    uint32_t inlinePayloadCapacity;
+    uint32_t overflowCapacity;
+    uint32_t overflowStride;
+    uint32_t overflowOffset;
     uint32_t bufferLimit;
     uint32_t mappingBytes;
     uint32_t stackDepth;
     uint32_t pageBytes;
     uint32_t followChildren;
+    uint32_t rawPointerProbes;
     uint32_t installedExportCount;
     wchar_t catalogMapping[CatalogMappingCapacity];
     int64_t frequency;
@@ -590,6 +597,7 @@ struct alignas(64) SharedHeader
     volatile LONGLONG installedApis;
     volatile LONGLONG entryBreaks;
     volatile LONGLONG exitBreaks;
+    volatile LONGLONG wrapGeneration;
     volatile LONGLONG nextCallId;
     // Admitted calls retain the agent's session mapping; recording calls still owe a published return.
     volatile LONGLONG activeCalls;
@@ -597,6 +605,7 @@ struct alignas(64) SharedHeader
     volatile LONGLONG waitTicks;
     alignas(64) volatile LONGLONG freeSlots;
     volatile LONGLONG enqueue;
+    alignas(64) volatile LONGLONG freeOverflowSlots;
     alignas(64) volatile LONGLONG readySlots;
     volatile LONGLONG published;
     alignas(64) volatile LONGLONG dequeue;
@@ -627,13 +636,31 @@ inline bool ApiExcluded(const SharedHeader& header, uint64_t hash)
     return false;
 }
 
+struct alignas(8) OverflowSlot
+{
+    volatile LONGLONG next;
+};
+static_assert(sizeof(OverflowSlot) == 8);
+
 struct alignas(64) Slot
 {
     volatile LONGLONG next;
     Event event;
     uint32_t index;
+    uint32_t overflowIndex;
+    int32_t bufferDelta;
+    uint32_t inputBytes;
+    uint32_t payloadOffset;
+    int64_t entryTimestamp;
 };
+static_assert(sizeof(Slot) == 384);
 #pragma warning(pop)
+
+inline uint32_t SlotMaxRemaining(const Slot* slot, const SharedHeader* header)
+{
+    const auto used = slot->payloadOffset + slot->event.payloadBytes;
+    return used < header->payloadCapacity ? header->payloadCapacity - used : 0;
+}
 
 inline uint32_t Align64(uint32_t value) { return (value + 63) & ~uint32_t{63}; }
 #ifdef DETOURIST_INSTRUCTION_CLIENT

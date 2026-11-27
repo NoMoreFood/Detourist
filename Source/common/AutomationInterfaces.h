@@ -44,7 +44,7 @@ inline void CaptureAutomationArrays(Slot* slot, SharedHeader* header, uint32_t p
         uint32_t owner, uint32_t element, uint32_t available) -> void
     {
         if (!pointer || depth == path.size() || available < VariantHeaderBytes ||
-            header->payloadCapacity - slot->event.payloadBytes < sizeof(Value)) return;
+            SlotMaxRemaining(slot, header) < sizeof(Value)) return;
         for (size_t index = 0; index < depth; ++index)
             if (path[index] == pointer) return;
         path[depth] = pointer;
@@ -71,7 +71,7 @@ inline void CaptureAutomationArrays(Slot* slot, SharedHeader* header, uint32_t p
         {
             if ((owner == UINT32_MAX && !(flags & StringArrayElement)) ||
                 header->bufferLimit < sizeof(AutomationLink) ||
-                header->payloadCapacity - slot->event.payloadBytes < sizeof(Value) + sizeof(AutomationLink)) return;
+                SlotMaxRemaining(slot, header) < sizeof(Value) + sizeof(AutomationLink)) return;
             AutomationLink relation{owner, element, child, value.vt};
             CopyValue(slot, header, parameter, ValueKind::AutomationLink,
                 reinterpret_cast<uint64_t>(&relation), sizeof(relation));
@@ -293,7 +293,7 @@ inline void CaptureAutomationBuffer(Slot* slot, SharedHeader* header, uint32_t p
     auto count = std::min<uint64_t>(captured.originalBytes / sizeof(VARIANT), UINT16_MAX + 1u);
     for (uint32_t index = 0; index < count &&
         uint64_t{index} * sizeof(VARIANT) + VariantHeaderBytes <= captured.capturedBytes &&
-        header->payloadCapacity - slot->event.payloadBytes >= sizeof(Value); ++index)
+        SlotMaxRemaining(slot, header) >= sizeof(Value); ++index)
     {
         auto offset = uint64_t{index} * sizeof(VARIANT);
         if (address > UINT64_MAX - offset) break;

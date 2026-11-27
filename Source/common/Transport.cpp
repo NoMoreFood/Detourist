@@ -11,7 +11,7 @@ namespace Detourist
 constexpr uint64_t ThreadIdTimeoutMs = 5000;
 constexpr DWORD ThreadIdPollMs = 1;
 constexpr DWORD AcquireSpaceTimeoutMs = 10;
-constexpr uint32_t ReadBatchMaximum = 32;
+constexpr uint32_t ReadBatchMaximum = 256;
 
 Transport::Transport(TransportStartup& startup) noexcept
     : mapping_(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(startup.handles.mapping))),
@@ -54,13 +54,29 @@ void Transport::Create(const std::wstring& name, uint32_t processId, uint32_t bu
     uint64_t captureMask, bool followChildren, const std::wstring& catalogName)
 {
     name_ = name;
-    // Allocate a fixed memory budget independent of trace length.
+    // Allocate compact inline slots plus a shared overflow tier within a fixed memory budget.
     bufferLimit = std::clamp(bufferLimit, MinimumBufferLimit, MaximumBufferLimit);
     uint32_t payload = (bufferLimit + sizeof(Value)) * 2 * MaximumArguments + MaximumStack * sizeof(uint64_t);
-    uint32_t stride = Align64(static_cast<uint32_t>(sizeof(Slot)) + payload);
+    uint32_t inlinePayload = std::min(payload, InlineSlotPayloadBytes);
+    uint32_t stride = Align64(static_cast<uint32_t>(sizeof(Slot)) + inlinePayload);
+    uint32_t overflowStride = payload > inlinePayload ?
+        Align64(static_cast<uint32_t>(sizeof(OverflowSlot)) + payload) : 0;
+    uint32_t overflowCapacity = 0;
+    if (overflowStride)
+    {
+        constexpr uint32_t maxOverflowBudget = 4 * 1024 * 1024 + 512 * 1024;
+        overflowCapacity = std::clamp(maxOverflowBudget / overflowStride, 2u, 64u);
+        while (overflowCapacity > 2 &&
+            uint64_t{sizeof(SharedHeader)} + 256ull * stride + uint64_t{overflowCapacity} * overflowStride >
+                TransportBudget)
+            --overflowCapacity;
+    }
+    const uint64_t overflowBytes = uint64_t{overflowCapacity} * overflowStride;
     uint32_t capacity = 2;
-    while ((capacity * 2ull * stride + sizeof(SharedHeader)) <= TransportBudget) capacity *= 2;
-    uint32_t bytes = static_cast<uint32_t>(sizeof(SharedHeader)) + capacity * stride;
+    while ((capacity * 2ull * stride + sizeof(SharedHeader) + overflowBytes) <= TransportBudget &&
+        capacity * 2 <= MaximumTransportCapacity) capacity *= 2;
+    uint32_t overflowOffset = static_cast<uint32_t>(sizeof(SharedHeader)) + capacity * stride;
+    uint32_t bytes = overflowOffset + static_cast<uint32_t>(overflowBytes);
     mapping_.reset(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes, name.c_str()));
     Check(static_cast<bool>(mapping_), "Create capture buffer");
     if (GetLastError() == ERROR_ALREADY_EXISTS) throw std::runtime_error("Capture buffer already exists.");
@@ -76,6 +92,10 @@ void Transport::Create(const std::wstring& name, uint32_t processId, uint32_t bu
     header_->capacity = capacity;
     header_->stride = stride;
     header_->payloadCapacity = payload;
+    header_->inlinePayloadCapacity = inlinePayload;
+    header_->overflowCapacity = overflowCapacity;
+    header_->overflowStride = overflowStride;
+    header_->overflowOffset = overflowOffset;
     header_->bufferLimit = bufferLimit;
     header_->mappingBytes = bytes;
     header_->stackDepth = std::min(stackDepth, MaximumStack);
@@ -84,6 +104,7 @@ void Transport::Create(const std::wstring& name, uint32_t processId, uint32_t bu
     header_->pageBytes = system.dwPageSize;
     header_->followChildren = followChildren;
     header_->enabledFilters = static_cast<LONGLONG>(CaptureFilters(captureMask, AllCategories));
+    header_->wrapGeneration = 1;
     header_->entryApi = -1;
     header_->exitApi = -1;
     LARGE_INTEGER frequency;
@@ -91,6 +112,7 @@ void Transport::Create(const std::wstring& name, uint32_t processId, uint32_t bu
     header_->frequency = frequency.QuadPart;
     header_->captureIdentity = static_cast<uint64_t>(Clock());
     header_->freeSlots = 1;
+    header_->freeOverflowSlots = overflowCapacity ? 1 : 0;
     header_->asyncFree = 1;
     for (uint32_t index = 0; index < AsyncIoCapacity; ++index)
         header_->asyncIo[index].next = index + 1 < AsyncIoCapacity ? index + 2 : 0;
@@ -100,6 +122,8 @@ void Transport::Create(const std::wstring& name, uint32_t processId, uint32_t bu
         slot->index = index + 1;
         slot->next = index + 1 < capacity ? index + 2 : 0;
     }
+    for (uint32_t index = 0; index < overflowCapacity; ++index)
+        PoolOverflowSlot(header_, index)->next = index + 1 < overflowCapacity ? index + 2 : 0;
 
     // Keep wakeups and debugger control independent of record storage.
     Check(BindEvents(true), "Create capture signals");
@@ -403,6 +427,8 @@ bool Transport::Read(Record& record)
     {
         record.event = view.event;
         record.payload.assign(view.payload.begin(), view.payload.end());
+        record.entryTimestamp = view.entryTimestamp;
+        record.inputBytes = view.inputBytes;
     }) != 0;
 }
 
@@ -413,9 +439,26 @@ uint32_t Transport::ReadBatch(uint32_t limit, const void* context,
     const auto batchLimit = std::min(ReadBatchMaximum, std::max(1u, header_->capacity / 4));
     Slot* freeHead = nullptr;
     Slot* freeTail = nullptr;
+    OverflowSlot* overflowHead = nullptr;
+    OverflowSlot* overflowTail = nullptr;
+    uint32_t overflowHeadIndex = 0;
     uint32_t count = 0, received = 0;
     auto release = [&](Transport*)
     {
+        if (overflowHead)
+        {
+            auto head = ReadShared64(header_->freeOverflowSlots);
+            for (;;)
+            {
+                overflowTail->next = PoolIndex(head);
+                auto observed = InterlockedCompareExchange64(&header_->freeOverflowSlots,
+                    NextPoolHead(head, overflowHeadIndex), head);
+                if (observed == head) break;
+                head = observed;
+            }
+            overflowHead = overflowTail = nullptr;
+            overflowHeadIndex = 0;
+        }
         if (!freeHead) return;
         auto head = ReadShared64(header_->freeSlots);
         for (;;)
@@ -456,9 +499,34 @@ uint32_t Transport::ReadBatch(uint32_t limit, const void* context,
             }
         }
         auto slot = PoolSlot(header_, readHead_ - 1);
-        if (slot->event.payloadBytes > header_->payloadCapacity) throw std::runtime_error("Invalid capture record.");
-        consume(context, {slot->event, {Payload(slot), slot->event.payloadBytes}});
+        const auto overflowIndex = slot->overflowIndex;
+        const std::byte* payloadData = reinterpret_cast<const std::byte*>(slot) + sizeof(Slot);
+        uint32_t maxPayload = header_->inlinePayloadCapacity;
+        if (overflowIndex)
+        {
+            if (overflowIndex > header_->overflowCapacity) throw std::runtime_error("Invalid capture record.");
+            payloadData = OverflowPayload(header_, overflowIndex - 1);
+            maxPayload = header_->payloadCapacity;
+        }
+        if (slot->event.payloadBytes > maxPayload ||
+            (slot->event.kind == EventKind::Completed && slot->inputBytes > slot->event.payloadBytes))
+            throw std::runtime_error("Invalid capture record.");
+        consume(context,
+            {slot->event, {payloadData, slot->event.payloadBytes}, slot->entryTimestamp, slot->inputBytes});
         readHead_ = static_cast<uint32_t>(slot->next);
+        if (overflowIndex)
+        {
+            auto overflow = PoolOverflowSlot(header_, overflowIndex - 1);
+            overflow->next = overflowHeadIndex;
+            if (!overflowHead) overflowTail = overflow;
+            overflowHead = overflow;
+            overflowHeadIndex = overflowIndex;
+        }
+        slot->overflowIndex = 0;
+        slot->bufferDelta = 0;
+        slot->inputBytes = 0;
+        slot->payloadOffset = 0;
+        slot->entryTimestamp = 0;
         slot->next = freeHead ? freeHead->index : 0;
         if (!freeHead) freeTail = slot;
         freeHead = slot;

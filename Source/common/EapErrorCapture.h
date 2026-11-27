@@ -29,7 +29,7 @@ void CaptureEapError(State& call, Slot* slot, bool leaving, uint32_t index, cons
         !static_cast<uint32_t>(call.event.result) || call.event.flags & (Skipped | Unwound | AsyncPending)) return;
     auto header = call.transport->Header();
     auto pointerSnapshot = slot->event.payloadBytes;
-    if (pointerSnapshot > header->payloadCapacity) return;
+    if (slot->payloadOffset + pointerSnapshot > header->payloadCapacity) return;
     auto pointer = CapturePointer(slot, header, index, address, true);
     if (!pointer || pointer == call.captureLimits[index])
     {

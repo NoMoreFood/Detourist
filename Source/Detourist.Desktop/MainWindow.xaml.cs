@@ -378,7 +378,8 @@ public partial class MainWindow : Window
         ["exitMask"] = "0",
         ["entryApi"] = settings.EntryApi,
         ["exitApi"] = settings.ExitApi,
-        ["instructionEngine"] = settings.InstructionEngine
+        ["instructionEngine"] = settings.InstructionEngine,
+        ["rawPointerProbes"] = settings.RawPointerProbes
     };
 
     private string NewDatabase(string name)

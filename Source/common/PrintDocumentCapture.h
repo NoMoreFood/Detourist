@@ -120,7 +120,7 @@ inline void CapturePrinterPayload(const Event& event, Slot* slot, SharedHeader* 
     constexpr uint32_t lengthOffset = sizeof(uintptr_t) == 8 ? 16 : 12;
     constexpr uint32_t pointerOffset = sizeof(uintptr_t) == 8 ? 24 : 16;
     uint32_t count = 0;
-    const auto available = header->payloadCapacity - slot->event.payloadBytes;
+    const auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + 12);
     if (header->bufferLimit < 12 || available < sizeof(Value) + 12 || address > UINTPTR_MAX - countOffset ||
         !ReadGuardedCaptureMemory(reinterpret_cast<const void*>(address + countOffset), &count, sizeof(count)))
     {

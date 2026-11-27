@@ -311,7 +311,11 @@ void Session::SetFilters(uint64_t mask, uint64_t categories)
     std::lock_guard lock(mutex_);
     filters_ = CaptureFilters(mask, categories);
     for (const auto& target : targets_)
-        InterlockedExchange64(&target->transport.Header()->enabledFilters, static_cast<LONGLONG>(filters_.load()));
+    {
+        auto header = target->transport.Header();
+        InterlockedExchange64(&header->enabledFilters, static_cast<LONGLONG>(filters_.load()));
+        InterlockedIncrement64(&header->wrapGeneration);
+    }
 }
 void Session::SetExcludedApis(const std::vector<std::string>& names)
 {
@@ -365,6 +369,7 @@ void Session::ApplyExclusions(Target& target)
             InterlockedExchange64(&header->excludedApis[vacant], static_cast<LONGLONG>(hash));
     }
     InterlockedExchange(&header->excludedApiCount, static_cast<LONG>(hashes.size()));
+    InterlockedIncrement64(&header->wrapGeneration);
 }
 
 void Session::SetBreaks(uint64_t entry, uint64_t exit) { entryBreaks_ = entry; exitBreaks_ = exit; }
@@ -649,6 +654,7 @@ std::unique_ptr<Session::Target> Session::PrepareTarget(DWORD pid, int64_t paren
     auto name = L"Local\\Detourist." + std::wstring(identity);
     target->transport.Create(name, pid, options_.bufferLimit, options_.stackDepth,
         filters_.load() & AllApis, options_.followChildren, CaptureCatalogName(target->pointerSize));
+    target->transport.Header()->rawPointerProbes = options_.rawPointerProbes ? 1 : 0;
     ApplyExclusions(*target);
     target->transport.Header()->enabledFilters = static_cast<LONGLONG>(filters_.load());
     target->transport.Header()->bootstrapDeferred = suspended;
@@ -730,12 +736,19 @@ std::unique_ptr<Session::Target> Session::PrepareTarget(DWORD pid, int64_t paren
 
 void Session::SyncBreaks(SharedHeader* header) const
 {
-    header->entryBreaks = static_cast<LONGLONG>(entryBreaks_.load());
-    header->exitBreaks = static_cast<LONGLONG>(exitBreaks_.load());
-    header->entryApi = entryApi_;
-    header->exitApi = exitApi_;
-    header->debuggerActive = (entryBreaks_ || exitBreaks_ || entryApi_ >= 0 || exitApi_ >= 0) ?
+    const auto entryBreaks = static_cast<LONGLONG>(entryBreaks_.load());
+    const auto exitBreaks = static_cast<LONGLONG>(exitBreaks_.load());
+    const auto entryApi = static_cast<LONG>(entryApi_);
+    const auto exitApi = static_cast<LONG>(exitApi_);
+    const bool changed = header->entryBreaks != entryBreaks || header->exitBreaks != exitBreaks ||
+        header->entryApi != entryApi || header->exitApi != exitApi;
+    header->entryBreaks = entryBreaks;
+    header->exitBreaks = exitBreaks;
+    header->entryApi = entryApi;
+    header->exitApi = exitApi;
+    header->debuggerActive = (entryBreaks || exitBreaks || entryApi >= 0 || exitApi >= 0) ?
         CooperativeDebugger : 0;
+    if (changed) InterlockedIncrement64(&header->wrapGeneration);
 }
 
 void Session::RegisterTarget(std::unique_ptr<Target> target)
@@ -751,9 +764,12 @@ void Session::RegisterTarget(std::unique_ptr<Target> target)
 
     // Register transports under the same lock used to publish pause and filter changes.
     std::lock_guard lock(mutex_);
-    header->enabledFilters = static_cast<LONGLONG>(filters_.load());
+    const auto activeFilters = static_cast<LONGLONG>(filters_.load());
+    const bool filtersChanged = header->enabledFilters != activeFilters;
+    header->enabledFilters = activeFilters;
     header->capturePaused = paused_ ? 1 : 0;
     SyncBreaks(header);
+    if (filtersChanged) InterlockedIncrement64(&header->wrapGeneration);
     ++totalProcesses_;
     auto release = target->transport.BootstrapReleaseEvent();
     targets_.push_back(std::move(target));

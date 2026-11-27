@@ -741,10 +741,12 @@ Json Collector::Dispatch(const Json& request)
                 {"apis", {"GetLastError", "GetCurrentThreadId", "GetCurrentProcessId", "GetCurrentThread",
                     "GetCurrentProcess", "IsThreadAFiber", "GetProcessHeap", "FlsGetValue"}}},
             {{"id", "runtime"}, {"name", "Runtime helpers"},
-                {"description", "Common queries, string comparison, error-state updates and C++ mutex helpers."},
+                {"description",
+                    "Common queries, string/memory primitives, allocator helpers and C++ mutex helpers."},
                 {"apis", {"GetLastError", "GetCurrentThreadId", "GetCurrentProcessId", "GetCurrentThread",
                     "GetCurrentProcess", "IsThreadAFiber", "GetProcessHeap", "FlsGetValue", "lstrcmpiW",
-                    "SetLastError", "_Mtx_lock", "_Mtx_unlock"}}}});
+                    "SetLastError", "_Mtx_lock", "_Mtx_unlock", "memcpy", "memmove", "memset", "_o_memset",
+                    "_free_base", "RtlCompareUnicodeString"}}}});
         return {{"protocol", 1}, {"pointerSize", sizeof(void*)}, {"catalog", std::move(catalog)},
             {"allApis", std::to_string(AllApis)}, {"categories", std::move(categories)},
             {"noiseProfiles", std::move(noiseProfiles)},
@@ -807,6 +809,7 @@ Json Collector::Dispatch(const Json& request)
         options.exitApi = static_cast<int32_t>(exit);
         options.followChildren = request.value("followChildren", true);
         options.instructionEngine = request.value("instructionEngine", false);
+        options.rawPointerProbes = request.value("rawPointerProbes", false);
         options.startMinimized = request.value("startMinimized", false);
         options.workingDirectory = Wide(request.value("workingDirectory", std::string{}));
         auto pid = static_cast<uint32_t>(Number(request, "pid", 0, MAXDWORD));

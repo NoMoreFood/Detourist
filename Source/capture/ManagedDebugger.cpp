@@ -1,6 +1,7 @@
 #include "ManagedAttach.h"
 #include "ManagedMetadata.h"
 #include "DebuggerCallbacks.h"
+#include "TransportPool.h"
 #include <metahost.h>
 #include <wrl/client.h>
 #include <detours.h>
@@ -766,9 +767,11 @@ void RuntimeDebugger::Publish(Event event, const std::vector<std::byte>& payload
 {
     if (auto slot = transport_.Acquire())
     {
-        event.payloadBytes = static_cast<uint32_t>(payload.size());
+        auto available = EnsureSlotPayload(slot, transport_.Header(), static_cast<uint32_t>(payload.size()));
+        auto bytes = std::min<uint32_t>(static_cast<uint32_t>(payload.size()), available);
+        event.payloadBytes = bytes;
         slot->event = event;
-        if (!payload.empty()) memcpy(Transport::Payload(slot), payload.data(), payload.size());
+        if (bytes) memcpy(Transport::Payload(slot), payload.data(), bytes);
         transport_.Publish(slot);
     }
 }

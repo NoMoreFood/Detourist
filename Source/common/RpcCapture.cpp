@@ -3,6 +3,7 @@
 #include <phnt.h>
 #pragma warning(pop)
 #include "RpcCapture.h"
+#include "TransportPool.h"
 #include "RpcFormats.h"
 #include "AsyncIo.h"
 #include "CatalogView.h"
@@ -583,7 +584,9 @@ public:
     uint16_t Append(uint32_t parameter, uint16_t parent, RpcValueType type, uint64_t address, uint64_t bytes,
         uint32_t offset = 0, uint32_t stride = 0, bool text = false, uint64_t storage = UINT64_MAX)
     {
-        const auto available = header_->payloadCapacity - slot_->event.payloadBytes;
+        const auto desired = static_cast<uint32_t>(std::min<uint64_t>(bytes, header_->bufferLimit));
+        const auto available = EnsureSlotPayload(slot_, header_,
+            static_cast<uint32_t>(sizeof(Value) + sizeof(RpcValueInfo)) + desired);
         if (next_ >= RpcMaxValueNodes || available < sizeof(Value) + sizeof(RpcValueInfo))
         { state_.info.flags |= RpcPartial; return RpcNoParent; }
         auto data = Transport::Payload(slot_) + slot_->event.payloadBytes;
@@ -1105,7 +1108,8 @@ void CaptureRpcValues(RpcCaptureState& state, Event& event, Slot* slot, SharedHe
         state.info.flags &= ~RpcOutputsDeferred;
     }
     const auto position = slot->event.payloadBytes;
-    if (header->payloadCapacity - position < sizeof(Value) + sizeof(RpcCallInfo)) return;
+    if (EnsureSlotPayload(slot, header, sizeof(Value) + sizeof(RpcCallInfo)) < sizeof(Value) + sizeof(RpcCallInfo))
+        return;
     slot->event.payloadBytes += sizeof(Value) + sizeof(RpcCallInfo);
     if (state.info.flags & RpcDescriptorValid && !(leaving && event.flags & (Skipped | Unwound)) &&
         !(leaving && event.flags & Failed && (objectAsync || event.kind == EventKind::AsyncCompletion)))

@@ -1,4 +1,5 @@
 #include "RpcFormats.h"
+#include "TransportPool.h"
 #include <rpc.h>
 #include <rpcndr.h>
 #include <ndr64types.h>
@@ -14,8 +15,10 @@ void CaptureRpcMarshalValues(const Event& event, Slot* slot, SharedHeader* heade
     if (event.flags & (Skipped | Unwound)) return;
     auto capture = [&](uint32_t parameter, uint64_t address, uint64_t length, ValueKind kind)
     {
-        const auto available = header->payloadCapacity - slot->event.payloadBytes;
-        if (!address || !length || available < sizeof(Value)) return;
+        if (!address || !length) return;
+        const auto desired = static_cast<uint32_t>(std::min<uint64_t>(length, header->bufferLimit));
+        const auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + desired);
+        if (available < sizeof(Value)) return;
         const auto captured = std::min<uint64_t>(length,
             std::min<uint64_t>(header->bufferLimit, available - sizeof(Value)));
         Value value{parameter, kind, 0, static_cast<uint32_t>(captured), length};

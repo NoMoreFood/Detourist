@@ -9,6 +9,7 @@
 #pragma warning(pop)
 #include "InstructionCapture.h"
 #include <algorithm>
+#include <utility>
 
 namespace Detourist
 {
@@ -36,6 +37,7 @@ uintptr_t ObserverRanges[4]{};
 BOOL (WINAPI* ObserverQuery)(ObserverContext*) = nullptr;
 void (WINAPI* ObserverUpdate)(const ObserverContext*) = nullptr;
 BOOL (WINAPI* ObserverBind)(ObserverThreadPointers*) = nullptr;
+void (WINAPI* ObserverFlushPending)() = nullptr;
 uint64_t (WINAPI* AsyncCallbackFactory)(uint64_t, uint64_t, uint32_t, uint64_t*) = nullptr;
 uint32_t (WINAPI* NativeStackCapture)(const CONTEXT*, uint64_t, uint64_t*, uint32_t, uint32_t*) = nullptr;
 uint32_t (WINAPI* NativeRpcSerialization)(uint64_t) = nullptr;
@@ -143,6 +145,8 @@ void ObserverModule(const module_data_t* module)
                 dr_get_proc_address(module->handle, "DetouristSetObserverContext"));
             ObserverBind = reinterpret_cast<decltype(ObserverBind)>(
                 dr_get_proc_address(module->handle, "DetouristBindObserverThread"));
+            ObserverFlushPending = reinterpret_cast<decltype(ObserverFlushPending)>(
+                dr_get_proc_address(module->handle, "DetouristFlushPendingEntry"));
             AsyncCallbackFactory = reinterpret_cast<decltype(AsyncCallbackFactory)>(
                 dr_get_proc_address(module->handle, "DetouristAsyncCallback"));
             NativeStackCapture = reinterpret_cast<decltype(NativeStackCapture)>(
@@ -245,6 +249,11 @@ bool InstructionObserver(void* context, InstructionThread* thread, uint64_t call
         thread->observerBound = false;
         thread->observerDetached = true;
     }
+    if (thread && thread->observerDetached)
+    {
+        if (observer) *observer = {};
+        return false;
+    }
     if (thread && !thread->observerBound && !thread->observerDetached && ObserverBind)
     {
         dr_switch_to_app_state(context);
@@ -283,6 +292,7 @@ void SetInstructionObserver(void* context, InstructionThread& thread, const Obse
         thread.observerBound = false;
         thread.observerDetached = true;
     }
+    if (thread.observerDetached) return;
     if (thread.observerBound)
     {
         if (*thread.observer.processShuttingDown) return;
@@ -416,9 +426,128 @@ uint32_t NameHash(const char* name)
     return hash % ExportBuckets;
 }
 
+void FlushThreadPendingSlots(void* context, InstructionThread& thread)
+{
+    if (thread.observerBound &&
+        thread.observer.slotGeneration->load(std::memory_order_acquire) != thread.observer.expectedGeneration)
+    {
+        thread.observerBound = false;
+        thread.observerDetached = true;
+    }
+    if (thread.observerBound && !*thread.observer.processShuttingDown &&
+        thread.observer.pendingSlot && *thread.observer.pendingSlot)
+    {
+        if (*thread.observer.captureIdentity == InstructionTransport.Header()->captureIdentity)
+        {
+            if (auto agentSlot = std::exchange(*thread.observer.pendingSlot, nullptr))
+            {
+                if (thread.observer.pendingTransport) *thread.observer.pendingTransport = nullptr;
+                InstructionTransport.Publish(agentSlot);
+            }
+        }
+        else if (ObserverFlushPending)
+        {
+            dr_switch_to_app_state(context);
+            ObserverFlushPending();
+            dr_switch_to_dr_state(context);
+        }
+    }
+    if (auto ownSlot = std::exchange(thread.pendingSlot, nullptr))
+        InstructionTransport.Publish(ownSlot);
+}
+
+bool IsBlockingExportName(const char* name, Api typed)
+{
+    if (typed < Api::Count && (ApiDefinitions[static_cast<uint32_t>(typed)].hookFlags & HookWait)) return true;
+    if (!name || !*name) return false;
+    return !strncmp(name, "NtWait", 6) || !strncmp(name, "ZwWait", 6) || !strncmp(name, "Wait", 4) ||
+        !strncmp(name, "Sleep", 5) || !strncmp(name, "MsgWait", 7) || strstr(name, "DelayExecution") != nullptr ||
+        strstr(name, "GetMessage") != nullptr || strstr(name, "WaitMessage") != nullptr ||
+        strstr(name, "RemoveIoCompletion") != nullptr || strstr(name, "AlpcSendWait") != nullptr;
+}
+
+bool AlwaysWrapExport(const InstructionDefinition& definition)
+{
+    if (definition.interfaceTable || IsComApi(definition.typed) || definition.marshalSlot ||
+        definition.marshalOperation || definition.entryOnly || definition.continuation ||
+        definition.wglLookup || definition.callbackRegistration || definition.ambiguousExport ||
+        definition.sharedExport)
+        return true;
+    if (!strcmp(definition.metadata.name, "DllMain") || !strncmp(definition.metadata.name, "TlsCallback", 11))
+        return true;
+    if (AsyncObserver(definition.asyncRole) || CreatesChild(definition.typed) ||
+        RpcSerializationApi(definition.typed))
+        return true;
+    if (definition.typed == Api::CreateMRUListW || definition.typed == Api::FreeMRUList ||
+        definition.typed == Api::WSAIoctl || definition.typed == Api::ComInvoke ||
+        definition.typed == Api::ComEnumVariantNext || definition.typed == Api::CoCreateInstanceFromApp ||
+        definition.typed == Api::CoGetInstanceFromFile || definition.typed == Api::CoGetInstanceFromIStorage)
+        return true;
+    if (definition.signature.interfaceOutputIndex || definition.interfaceInputs ||
+        PublicInterfaceOutputs(definition.typed))
+        return true;
+    return definition.runtime &&
+        (definition.runtime->interfaceParameters || definition.runtime->resultInterfaceIndex);
+}
+
+bool ShouldWrapExport(const InstructionDefinition& definition, const SharedHeader& header)
+{
+    if (definition.alwaysWrap || definition.sharedExport) return true;
+    if (((header.entryBreaks | header.exitBreaks) & definition.mask) ||
+        header.entryApi == static_cast<LONG>(definition.id) ||
+        header.exitApi == static_cast<LONG>(definition.id))
+        return true;
+    return FilterEnabled(static_cast<uint64_t>(header.enabledFilters), definition.mask, definition.categoryMask) &&
+        !ApiExcluded(header, definition.nameHash);
+}
+
+void CountExportCoverage(InstructionDefinition& definition, bool adding);
+
+void SyncExportWraps()
+{
+    auto header = InstructionTransport.Header();
+    if (!WrapSyncLock || !header) return;
+    dr_mutex_lock(WrapSyncLock);
+    for (;;)
+    {
+        const auto generation = ReadShared64(header->wrapGeneration);
+        if (generation == AppliedWrapGeneration) break;
+        dr_mutex_lock(DefinitionLock);
+        auto head = AllExports;
+        dr_mutex_unlock(DefinitionLock);
+        for (auto definition = head; definition; definition = definition->nextAll)
+        {
+            if (definition->retired || definition->superseded || definition->wrapFailed ||
+                definition->wrapped || definition->interfaceTable || definition->marshalSlot)
+                continue;
+            if (!ShouldWrapExport(*definition, *header)) continue;
+            const auto wrapped = drwrap_wrap_ex(static_cast<app_pc>(definition->address), &ExportEntered,
+                definition->entryOnly ? nullptr : &ExportLeft, definition, InstructionWrapConvention);
+            dr_mutex_lock(DefinitionLock);
+            if (!definition->retired && !definition->superseded)
+            {
+                if (wrapped) definition->wrapped = true;
+                else
+                {
+                    definition->wrapFailed = true;
+                    header->moduleRefreshError = ERROR_NOT_SUPPORTED;
+                    CountExportCoverage(*definition, false);
+                }
+            }
+            else if (wrapped)
+                drwrap_unwrap(static_cast<app_pc>(definition->address), &ExportEntered,
+                    definition->entryOnly ? nullptr : &ExportLeft);
+            dr_mutex_unlock(DefinitionLock);
+        }
+        InterlockedExchange64(&AppliedWrapGeneration, generation);
+    }
+    dr_mutex_unlock(WrapSyncLock);
+}
+
 void InitializeExports()
 {
     auto header = InstructionTransport.Header();
+    InterlockedExchange64(&AppliedWrapGeneration, ReadShared64(header->wrapGeneration));
     header->installedNativeCount = header->availableNativeCount = 0;
     header->installedWin32Count = header->availableWin32Count = 0;
     header->installedComCount = header->installedExportCount = 0;
@@ -437,7 +566,7 @@ void CountExportCoverage(InstructionDefinition& definition, bool adding)
     definition.coverageCounted = adding;
     auto header = InstructionTransport.Header();
     auto change = adding ? 1 : -1;
-    if (definition.wrapped)
+    if (!definition.wrapFailed)
     {
         if (definition.interfaceTable || IsComApi(definition.typed))
             InterlockedExchangeAdd(reinterpret_cast<volatile LONG*>(&header->installedComCount), change);
@@ -453,7 +582,7 @@ void CountExportCoverage(InstructionDefinition& definition, bool adding)
     // Multiple export bodies and forwarders contribute one catalog identity until its final image unloads.
     if (adding ? AvailableReferences[index]++ == 0 : --AvailableReferences[index] == 0)
         InterlockedExchangeAdd(reinterpret_cast<volatile LONG*>(&available), change);
-    if (definition.wrapped && (adding ? InstalledReferences[index]++ == 0 : --InstalledReferences[index] == 0))
+    if (!definition.wrapFailed && (adding ? InstalledReferences[index]++ == 0 : --InstalledReferences[index] == 0))
         InterlockedExchangeAdd(reinterpret_cast<volatile LONG*>(&installed), change);
 }
 
@@ -604,7 +733,11 @@ void InstallInterfaceWrap(InstructionDefinition& definition)
         definition.wrapped = true;
         definition.interfaceWrapPending = false;
     }
-    else if (definition.interfaceWrapPending) InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+    else
+    {
+        definition.wrapFailed = true;
+        if (definition.interfaceWrapPending) InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+    }
     dr_mutex_unlock(DefinitionLock);
 }
 
@@ -629,8 +762,10 @@ void ObserveInterfaceMethod(void* address, void* table, const GUID& iid, uint32_
             (existing->provisional && !provisional && (!existing->runtime || runtime));
         if (existing->known || (typed == Api::Count && !update))
         {
-            if (primary->interfaceWrapPending)
+            if (primary->interfaceWrapPending || (!primary->wrapped && !primary->wrapFailed))
             {
+                primary->alwaysWrap = true;
+                primary->interfaceWrapPending = true;
                 // drwrap can flush translated code and must run outside the definition lock.
                 dr_mutex_unlock(DefinitionLock);
                 InstallInterfaceWrap(*primary);
@@ -721,11 +856,15 @@ void ObserveInterfaceMethod(void* address, void* table, const GUID& iid, uint32_
     definition->categoryMask = CategoryMask(definition->metadata.category);
     definition->nameHash = ApiNameHash(definition->metadata.name);
     definition->asyncRole = AsyncRole(definition->metadata.module, definition->metadata.name);
+    definition->blockingCall = IsBlockingExportName(definition->metadata.name, definition->typed);
+    definition->alwaysWrap = true;
     definition->nextAll = AllExports;
     AllExports = definition;
     if (primary)
     {
         if (shared) InterlockedExchange(&primary->sharedComAddress, 1);
+        primary->alwaysWrap = true;
+        if (!primary->wrapped && !primary->wrapFailed) primary->interfaceWrapPending = true;
         definition->nextVariant = primary->variants;
         InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&primary->variants), definition);
     }
@@ -798,6 +937,8 @@ void ObserveExtensionPointer(void* address, const char* name, uint32_t count, Ex
     definition->nameHash = ApiNameHash(name);
     definition->asyncRole = AsyncRole(definition->metadata.module, definition->metadata.name);
     definition->sourceNameHash = definition->nameHash;
+    definition->blockingCall = IsBlockingExportName(name, definition->typed);
+    definition->alwaysWrap = AlwaysWrapExport(*definition);
     definition->next = Exports[bucket];
     Exports[bucket] = definition;
     definition->nextAll = AllExports;
@@ -806,13 +947,17 @@ void ObserveExtensionPointer(void* address, const char* name, uint32_t count, Ex
     dr_free_module_data(module);
 
     // Register before the application resumes from its lookup and can invoke the returned entry point.
-    definition->wrapped = drwrap_wrap_ex(static_cast<app_pc>(address), &ExportEntered, &ExportLeft,
-        definition, InstructionWrapConvention);
-    if (!definition->wrapped)
+    if (ShouldWrapExport(*definition, *InstructionTransport.Header()))
     {
-        definition->retired = true;
-        InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
-        return;
+        definition->wrapped = drwrap_wrap_ex(static_cast<app_pc>(address), &ExportEntered, &ExportLeft,
+            definition, InstructionWrapConvention);
+        if (!definition->wrapped)
+        {
+            definition->wrapFailed = true;
+            definition->retired = true;
+            InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+            return;
+        }
     }
     dr_mutex_lock(DefinitionLock);
     CountExportCoverage(*definition, true);
@@ -1184,7 +1329,29 @@ void DiscoverExports(const module_data_t* module, bool forwardersOnly)
         if (existing && (existing->ambiguousExport ||
             !ambiguousAlias && (existing->known || (typed == Api::Count && !namedOrdinal && !typedRuntime))))
         {
+            const bool ensureSharedWrap = distinctAlias && !existing->wrapped && !existing->wrapFailed &&
+                !existing->retired && !existing->superseded;
             dr_mutex_unlock(DefinitionLock);
+            if (ensureSharedWrap)
+            {
+                const auto wrapped = drwrap_wrap_ex(static_cast<app_pc>(existing->address), &ExportEntered,
+                    existing->entryOnly ? nullptr : &ExportLeft, existing, InstructionWrapConvention);
+                dr_mutex_lock(DefinitionLock);
+                if (!existing->retired && !existing->superseded)
+                {
+                    if (wrapped) existing->wrapped = true;
+                    else
+                    {
+                        existing->wrapFailed = true;
+                        InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+                        CountExportCoverage(*existing, false);
+                    }
+                }
+                else if (wrapped)
+                    drwrap_unwrap(static_cast<app_pc>(existing->address), &ExportEntered,
+                        existing->entryOnly ? nullptr : &ExportLeft);
+                dr_mutex_unlock(DefinitionLock);
+            }
             return;
         }
         if (!existing && !nonImageEntry && (address < module->start || address >= module->end))
@@ -1308,6 +1475,10 @@ void DiscoverExports(const module_data_t* module, bool forwardersOnly)
         definition->categoryMask = CategoryMask(definition->metadata.category);
         definition->nameHash = ApiNameHash(definition->metadata.name);
         definition->asyncRole = AsyncRole(definition->metadata.module, definition->metadata.name);
+        definition->blockingCall = IsBlockingExportName(exportName, definition->typed);
+        definition->alwaysWrap = AlwaysWrapExport(*definition);
+        bool unwrapExisting = false;
+        bool existingEntryOnly = false;
         if (existing)
         {
             // Active invocations retain their immutable metadata while a named forwarder replaces the raw identity.
@@ -1317,8 +1488,12 @@ void DiscoverExports(const module_data_t* module, bool forwardersOnly)
                 existing->nextVariant = definition->variants;
                 definition->variants = existing;
             }
+            if (definition->variants) definition->alwaysWrap = true;
             CountExportCoverage(*existing, false);
+            unwrapExisting = existing->wrapped != 0;
+            existingEntryOnly = existing->entryOnly;
             existing->wrapped = false;
+            existing->superseded = true;
         }
         definition->next = Exports[bucket];
         Exports[bucket] = definition;
@@ -1327,10 +1502,19 @@ void DiscoverExports(const module_data_t* module, bool forwardersOnly)
         dr_mutex_unlock(DefinitionLock);
 
         // Wrapping can flush translated code, so no client lock may be held here.
-        definition->wrapped = drwrap_wrap_ex(address, &ExportEntered,
-            definition->entryOnly ? nullptr : &ExportLeft, definition,
-            InstructionWrapConvention);
-        if (!definition->wrapped) InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+        if (unwrapExisting)
+            drwrap_unwrap(address, &ExportEntered, existingEntryOnly ? nullptr : &ExportLeft);
+        if (ShouldWrapExport(*definition, *InstructionTransport.Header()))
+        {
+            definition->wrapped = drwrap_wrap_ex(address, &ExportEntered,
+                definition->entryOnly ? nullptr : &ExportLeft, definition,
+                InstructionWrapConvention);
+            if (!definition->wrapped)
+            {
+                definition->wrapFailed = true;
+                InstructionTransport.Header()->moduleRefreshError = ERROR_NOT_SUPPORTED;
+            }
+        }
         dr_mutex_lock(DefinitionLock);
         CountExportCoverage(*definition, true);
         dr_mutex_unlock(DefinitionLock);

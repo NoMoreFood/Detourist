@@ -274,8 +274,9 @@ bool ReadStackImage(uint64_t pc, uint64_t& base, uint32_t& bytes, IMAGE_DATA_DIR
 }
 
 bool StackFunction(uint64_t pc, uint64_t base, uint32_t bytes, uint64_t functions, uint32_t count,
-    RUNTIME_FUNCTION& function, bool& leaf, bool guarded = false, bool unordered = false)
+    RUNTIME_FUNCTION& function, bool& leaf, bool guarded = false, bool unordered = false, bool* pureRspOut = nullptr)
 {
+    if (pureRspOut) *pureRspOut = true;
     auto read = [guarded](const void* source, void* destination, size_t length)
     {
         return guarded ? ReadStackMemory(source, destination, length) : ReadCaptureMemory(source, destination, length);
@@ -338,13 +339,29 @@ bool StackFunction(uint64_t pc, uint64_t base, uint32_t bytes, uint64_t function
         uint8_t header[4]{};
         if (!read(reinterpret_cast<void*>(base + unwind), header, sizeof(header)) ||
             (header[0] & 7) < 1 || (header[0] & 7) > 2) return false;
+        if (pureRspOut && (header[3] & 0x0Fu)) *pureRspOut = false;
         const auto tail = uint64_t{unwind} + 4 + ((header[2] + 1u) & ~1u) * 2;
         if (tail > bytes) return false;
-        if (guarded)
+        const auto codeBytes = static_cast<size_t>(tail - unwind - 4);
+        if (guarded || (pureRspOut && *pureRspOut && codeBytes))
         {
             uint8_t codes[MaxUnwindCodeBytes];
-            if (!read(reinterpret_cast<void*>(base + unwind + 4), codes,
-                static_cast<size_t>(tail - unwind - 4))) return false;
+            if (!read(reinterpret_cast<void*>(base + unwind + 4), codes, codeBytes))
+            {
+                if (guarded) return false;
+                if (pureRspOut) *pureRspOut = false;
+            }
+            else if (pureRspOut && *pureRspOut)
+            {
+                for (uint32_t codeIndex = 0; codeIndex < header[2]; ++codeIndex)
+                {
+                    const auto op = codes[codeIndex * 2 + 1] & 0x0Fu;
+                    if (op == 3 || op == 10) { *pureRspOut = false; break; }
+                    if (op == 1) codeIndex += (codes[codeIndex * 2 + 1] >> 4) ? 2u : 1u;
+                    else if (op == 4 || op == 8) ++codeIndex;
+                    else if (op == 5 || op == 9) codeIndex += 2u;
+                }
+            }
         }
         if (!(header[0] >> 3 & UNW_FLAG_CHAININFO)) return true;
         RUNTIME_FUNCTION chained{};
@@ -421,12 +438,30 @@ bool UnwindDynamicStack(CONTEXT& context)
     return unwound;
 }
 
+constexpr size_t CachedStackFunctionCount = 256;
 struct StackImage
 {
     uint64_t base = 0;
     uint32_t bytes = 0;
     IMAGE_DATA_DIRECTORY functions{};
     MEMORY_BASIC_INFORMATION region{};
+};
+struct CachedStackFunction
+{
+    uint64_t pc = 0;
+    uint64_t base = 0;
+    RUNTIME_FUNCTION function{};
+    bool leaf = false;
+    bool pureRsp = false;
+};
+struct CachedWalkFrame
+{
+    uint64_t rip = 0;
+    uint64_t rsp = 0;
+    uint64_t nextRip = 0;
+    uint64_t nextRsp = 0;
+    bool pureRsp = false;
+    bool pureTail = false;
 };
 struct ThreadStackCache
 {
@@ -435,12 +470,15 @@ struct ThreadStackCache
     MEMORY_BASIC_INFORMATION stack{};
     StackImage images[CachedStackImageCount]{};
     uint32_t nextImage = 0;
+    CachedStackFunction functions[CachedStackFunctionCount]{};
+    CachedWalkFrame walk[MaximumStack]{};
+    uint32_t walkCount = 0;
 };
 [[msvc::no_tls_guard]] constinit thread_local ThreadStackCache CachedStackState{};
 
 uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uint32_t limit, uint32_t& flags)
 {
-    // Reuse validated image unwind directories and TEB stack bounds until memory protection or module state changes.
+    // Reuse validated image unwind directories, function entries, and verified pure-RSP stack suffixes.
     const auto currentEpoch = ActiveTransport ? ReadShared64(DetouristStackImageEpoch) : 0;
     if (currentEpoch && CachedStackState.epoch != currentEpoch)
     {
@@ -466,14 +504,52 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
         {
             CachedStackState.tibStackBase = tib.StackBase;
             CachedStackState.stack = stack;
+            CachedStackState.walkCount = 0;
         }
     }
     const auto allocation = stack.AllocationBase;
     bool recording = !caller;
+    bool canCacheWalk = currentEpoch != 0 && tebStack;
+    bool reusedSuffix = false;
+    uint32_t matchedSuffix = 0;
+    CachedWalkFrame currentWalk[MaximumStack];
+    uint32_t currentWalkCount = 0;
     __try
     {
         for (uint32_t depth = 0; context.Rip && depth < MaxWalkDepth; ++depth)
         {
+            recording |= context.Rip == caller;
+            if (recording && canCacheWalk && !flags && CachedStackState.walkCount > 0)
+            {
+                const auto topNextRsp = CachedStackState.walk[CachedStackState.walkCount - 1].nextRsp;
+                if (topNextRsp >= context.Rsp + sizeof(uint64_t) &&
+                    topNextRsp <= reinterpret_cast<uint64_t>(tib.StackBase) &&
+                    topNextRsp - sizeof(uint64_t) - reinterpret_cast<uint64_t>(stack.BaseAddress) < stack.RegionSize)
+                {
+                    for (uint32_t match = 0; match < CachedStackState.walkCount; ++match)
+                    {
+                        const auto& entry = CachedStackState.walk[match];
+                        if (!entry.pureTail || entry.rip != context.Rip || entry.rsp != context.Rsp) continue;
+                        bool verified = true;
+                        for (uint32_t verify = match; verify < CachedStackState.walkCount; ++verify)
+                        {
+                            const auto& step = CachedStackState.walk[verify];
+                            const auto slotAddr = reinterpret_cast<const uint64_t*>(step.nextRsp - sizeof(uint64_t));
+                            if (*slotAddr != step.nextRip) { verified = false; break; }
+                        }
+                        if (!verified) break;
+                        for (uint32_t copy = match; copy < CachedStackState.walkCount; ++copy)
+                        {
+                            if (count == limit) { flags |= Truncated; break; }
+                            frames[count++] = CachedStackState.walk[copy].rip;
+                        }
+                        reusedSuffix = true;
+                        matchedSuffix = match;
+                        break;
+                    }
+                    if (reusedSuffix) break;
+                }
+            }
             StackImage* cached = nullptr;
             if (currentEpoch)
             {
@@ -501,18 +577,35 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
             }
             const auto image = cached->base;
             const auto& functions = cached->functions;
-            recording |= context.Rip == caller;
             if (recording)
             {
                 if (count == limit) { flags |= Truncated; break; }
                 frames[count++] = context.Rip;
             }
+            const auto stepRip = context.Rip;
             const auto previous = context.Rsp;
             RUNTIME_FUNCTION function{};
             bool leaf = false;
-            if (image && !StackFunction(context.Rip, image, cached->bytes, image + functions.VirtualAddress,
-                functions.Size / static_cast<uint32_t>(sizeof(RUNTIME_FUNCTION)), function, leaf))
-            { flags |= Truncated; break; }
+            bool pureRsp = false;
+            if (image)
+            {
+                auto* funcSlot = currentEpoch ?
+                    &CachedStackState.functions[(stepRip >> 2) & (CachedStackFunctionCount - 1)] : nullptr;
+                if (funcSlot && funcSlot->pc == stepRip && funcSlot->base == image)
+                {
+                    function = funcSlot->function;
+                    leaf = funcSlot->leaf;
+                    pureRsp = funcSlot->pureRsp;
+                }
+                else
+                {
+                    if (!StackFunction(stepRip, image, cached->bytes, image + functions.VirtualAddress,
+                        functions.Size / static_cast<uint32_t>(sizeof(RUNTIME_FUNCTION)), function, leaf,
+                        false, false, &pureRsp))
+                    { flags |= Truncated; break; }
+                    if (funcSlot) *funcSlot = {stepRip, image, function, leaf, pureRsp};
+                }
+            }
             if (!image)
             {
                 if (!UnwindDynamicStack(context)) { flags |= Truncated; break; }
@@ -530,6 +623,18 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, &function, &context,
                     &handler, &establisher, nullptr);
             }
+            if (recording && canCacheWalk)
+            {
+                if (context.Rsp > previous && currentWalkCount < MaximumStack)
+                {
+                    uint64_t slotValue = UINT64_MAX;
+                    const bool stepPure = image != 0 && pureRsp &&
+                        ReadCaptureMemory(reinterpret_cast<const void*>(context.Rsp - sizeof(uint64_t)),
+                            &slotValue, sizeof(slotValue)) && slotValue == context.Rip;
+                    currentWalk[currentWalkCount++] = {stepRip, previous, context.Rip, context.Rsp, stepPure, false};
+                }
+                else canCacheWalk = false;
+            }
             if (!context.Rip) break;
             if (context.Rsp <= previous) { flags |= Truncated; break; }
             if (context.Rsp - reinterpret_cast<uint64_t>(stack.BaseAddress) >= stack.RegionSize)
@@ -545,6 +650,31 @@ uint32_t WalkStaticStack(CONTEXT context, uint64_t caller, uint64_t* frames, uin
                 stack.Protect & (PAGE_GUARD | PAGE_NOACCESS))
             { flags |= Truncated; break; }
             if (depth + 1 == MaxWalkDepth) flags |= Truncated;
+        }
+        if (canCacheWalk && !flags)
+        {
+            if (reusedSuffix && matchedSuffix > 0 &&
+                currentWalkCount + (CachedStackState.walkCount - matchedSuffix) <= MaximumStack)
+            {
+                const auto tailCount = CachedStackState.walkCount - matchedSuffix;
+                memmove(&CachedStackState.walk[currentWalkCount], &CachedStackState.walk[matchedSuffix],
+                    tailCount * sizeof(CachedWalkFrame));
+                if (currentWalkCount)
+                    memcpy(CachedStackState.walk, currentWalk, currentWalkCount * sizeof(CachedWalkFrame));
+                CachedStackState.walkCount = currentWalkCount + tailCount;
+            }
+            else if (!reusedSuffix && !context.Rip && currentWalkCount > 0)
+            {
+                memcpy(CachedStackState.walk, currentWalk, currentWalkCount * sizeof(CachedWalkFrame));
+                CachedStackState.walkCount = currentWalkCount;
+            }
+            else if (!reusedSuffix) CachedStackState.walkCount = 0;
+            bool tailPure = true;
+            for (uint32_t index = CachedStackState.walkCount; index-- > 0;)
+            {
+                tailPure = tailPure && CachedStackState.walk[index].pureRsp;
+                CachedStackState.walk[index].pureTail = tailPure;
+            }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { flags |= Truncated | Unreadable; }

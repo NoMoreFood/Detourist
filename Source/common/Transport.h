@@ -10,13 +10,17 @@ struct RecordView
 {
     const Event& event;
     std::span<const std::byte> payload;
+    int64_t entryTimestamp = 0;
+    uint32_t inputBytes = 0;
 };
 
 struct Record
 {
     Event event{};
     std::vector<std::byte> payload;
-    operator RecordView() const { return {event, payload}; }
+    int64_t entryTimestamp = 0;
+    uint32_t inputBytes = 0;
+    operator RecordView() const { return {event, payload, entryTimestamp, inputBytes}; }
 };
 
 class Transport
@@ -59,7 +63,10 @@ public:
     HANDLE BreakEvent() const { return break_.get(); }
     HANDLE BootstrapReleaseEvent() const { return bootstrapRelease_.get(); }
     HANDLE StartupThread() const { return startupThread_.get(); }
-    static std::byte* Payload(Slot* slot) { return reinterpret_cast<std::byte*>(slot) + sizeof(Slot); }
+    static std::byte* Payload(Slot* slot)
+    {
+        return reinterpret_cast<std::byte*>(slot) + sizeof(Slot) + slot->bufferDelta + slot->payloadOffset;
+    }
 private:
     bool BindEvents(bool create);
     bool Map(uint32_t processId, uint64_t captureIdentity = 0);

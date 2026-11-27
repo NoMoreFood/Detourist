@@ -280,6 +280,7 @@ private:
     std::unordered_set<uint64_t> threads_;
     std::unordered_map<uint64_t, uint32_t> argumentCounts_;
     std::unordered_map<int64_t, std::array<uint32_t, 11>> coverage_;
+    bool multiTargetIndexed_ = false;
 };
 std::wstring DescribeCall(const CallRow& call, int64_t frequency);
 
@@ -333,7 +334,9 @@ void ResolveCaller(const std::vector<ModuleRow>& modules, CallRow& call);
 bool ApplicationModule(const std::string& path);
 const ModuleRow* CallerModule(const std::vector<ModuleRow>& modules, int64_t target,
     uint64_t caller, uint64_t epoch);
-std::string CallSelect(bool payload, bool summary, bool threadDelta, const std::string& marks = "0");
+bool HasProcessIndex(sqlite3* raw);
+std::string CallSelect(bool payload, bool summary, bool threadDelta, bool processIndexed = true,
+    const std::string& marks = "0");
 CallRow ReadCall(sqlite3* raw, sqlite3_stmt* calls, bool payload);
 
 enum class ViewOrder { Oldest, Newest, Slowest };

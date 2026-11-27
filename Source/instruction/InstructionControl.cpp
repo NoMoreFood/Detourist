@@ -2,6 +2,7 @@
 #include <phnt_windows.h>
 #include <phnt.h>
 #include "dr_api.h"
+#include "drmgr.h"
 #pragma warning(pop)
 #include "InstructionCapture.h"
 
@@ -36,6 +37,12 @@ bool InstructionBreakpoint(InstructionFrame& call, bool leaving)
     {
         InterlockedExchange(&breakpoint.ownerThread, 0);
         return false;
+    }
+    if (leaving)
+    {
+        auto context = dr_get_current_drcontext();
+        if (auto thread = static_cast<InstructionThread*>(drmgr_get_tls_field(context, ThreadSlot)))
+            FlushThreadPendingSlots(context, *thread);
     }
 
     // The collector suspends the process after this invocation has published its editable state.

@@ -392,9 +392,15 @@ public sealed class SettingsWindow : ToolWindow
             Content = "Show app calls initially", IsChecked = settings.FromAppOnCapture, Margin = new(0, 8, 0, 0),
             ToolTip = "Start new captures with the From app display filter. Other calls are still recorded."
         };
+        var rawProbes = new CheckBox
+        {
+            Content = "Probe Raw Argument Pointers", IsChecked = settings.RawPointerProbes, Margin = new(0, 8, 0, 0),
+            ToolTip = "Dereference candidate pointer slots on unknown exports and syscalls during broad capture."
+        };
         switches.Children.Add(children);
         switches.Children.Add(stacks);
         switches.Children.Add(fromApp);
+        switches.Children.Add(rawProbes);
         switches.Children.Add(new TextBlock
         {
             Text = "Broad coverage: all DLL exports, syscall instructions and discovered interface slots. " +
@@ -685,6 +691,7 @@ public sealed class SettingsWindow : ToolWindow
             settings.InstructionEngine = engine.SelectedIndex == 0;
             settings.Stacks = stacks.IsChecked == true;
             settings.FromAppOnCapture = fromApp.IsChecked == true;
+            settings.RawPointerProbes = rawProbes.IsChecked == true;
             settings.FollowChildren = children.IsChecked == true;
             settings.TraceFolder = folder.Text.Trim().Equals(CaptureSettings.DefaultTraceDirectory,
                 StringComparison.OrdinalIgnoreCase) ? "" : folder.Text.Trim();

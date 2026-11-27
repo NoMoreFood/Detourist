@@ -1,5 +1,6 @@
 #include "Agent.h"
 #include "CaptureValues.h"
+#include "TransportPool.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -28,7 +29,18 @@ Transport* ActiveTransport = nullptr;
 [[msvc::no_tls_guard]] constinit thread_local Api CallApi = Api::Count;
 [[msvc::no_tls_guard]] constinit thread_local uint64_t CallIdentity = 0;
 [[msvc::no_tls_guard]] constinit thread_local bool FollowingChild = false;
+[[msvc::no_tls_guard]] constinit thread_local Slot* PendingEntrySlot = nullptr;
+[[msvc::no_tls_guard]] constinit thread_local Transport* PendingEntryTransport = nullptr;
 std::unique_ptr<Transport> SessionTransport;
+
+void FlushPendingEntrySlot() noexcept
+{
+    if (auto slot = std::exchange(PendingEntrySlot, nullptr))
+    {
+        auto owner = std::exchange(PendingEntryTransport, nullptr);
+        if (owner) owner->Publish(slot);
+    }
+}
 std::vector<std::unique_ptr<Transport>> RetiredTransports;
 std::atomic<bool> Initializing = false;
 std::atomic<bool> WorkerRunning = false;
@@ -57,12 +69,31 @@ bool IsFailure(Api api, uint64_t result)
 void Emit(Call& call, bool leaving, std::span<const std::byte> payload)
 {
     auto header = call.transport->Header();
-    auto slot = call.transport->Acquire();
-    if (!slot) return;
-    slot->event = call.event;
-    slot->event.kind = leaving ? EventKind::Leave : EventKind::Enter;
-    slot->event.timestamp = Clock();
-    slot->event.payloadBytes = 0;
+    Slot* slot = nullptr;
+    bool fused = false;
+    if (leaving && call.deferredSlot && PendingEntrySlot == call.deferredSlot)
+    {
+        slot = std::exchange(PendingEntrySlot, nullptr);
+        PendingEntryTransport = nullptr;
+        fused = true;
+        const auto savedEpoch = slot->event.moduleEpoch;
+        slot->inputBytes = slot->event.payloadBytes;
+        slot->payloadOffset = slot->inputBytes;
+        slot->event = call.event;
+        slot->event.moduleEpoch = savedEpoch;
+        slot->event.kind = EventKind::Completed;
+        slot->event.timestamp = Clock();
+        slot->event.payloadBytes = 0;
+    }
+    else
+    {
+        slot = call.transport->Acquire();
+        if (!slot) return;
+        slot->event = call.event;
+        slot->event.kind = leaving ? EventKind::Leave : EventKind::Enter;
+        slot->event.timestamp = Clock();
+        slot->event.payloadBytes = 0;
+    }
     const auto& args = call.event.arguments;
     auto bytes = [&](uint32_t index, uint64_t size, ValueKind kind = ValueKind::Bytes)
     {
@@ -89,10 +120,10 @@ void Emit(Call& call, bool leaving, std::span<const std::byte> payload)
         memcpy(&value, payload.data(), sizeof(value));
         payload = payload.subspan(sizeof(Value));
         if (value.capturedBytes > payload.size()) break;
-        auto available = header->payloadCapacity - slot->event.payloadBytes;
+        auto desired = std::min(value.capturedBytes, header->bufferLimit);
+        auto available = EnsureSlotPayload(slot, header, static_cast<uint32_t>(sizeof(Value)) + desired);
         if (available < sizeof(Value)) break;
-        auto captured = std::min({value.capturedBytes, header->bufferLimit,
-            available - static_cast<uint32_t>(sizeof(Value))});
+        auto captured = std::min(desired, available - static_cast<uint32_t>(sizeof(Value)));
         auto originalCaptured = value.capturedBytes;
         if (captured < originalCaptured) value.flags |= Truncated;
         value.capturedBytes = captured;
@@ -118,9 +149,32 @@ void Emit(Call& call, bool leaving, std::span<const std::byte> payload)
         default: break;
         }
         CaptureCallStack(call, slot);
+
+        // Defer non-blocking synchronous entries so leaf calls publish one combined record on return.
+        const bool canDefer = !slot->overflowIndex && !call.skipped && !(call.event.flags & Continuation) &&
+            call.asyncRole == AsyncIoRole::None && !call.rpc && !IsManagedApi(call.event.api) &&
+            !CreatesChild(call.event.api) && !header->debuggerActive &&
+            !header->entryBreaks && !header->exitBreaks && header->entryApi < 0 && header->exitApi < 0 &&
+            !(call.event.api < Api::Count && (ApiDefinitions[static_cast<uint32_t>(call.event.api)].hookFlags &
+                (HookWait | HookContinuation | HookProcessTermination)));
+        if (canDefer)
+        {
+            FlushPendingEntrySlot();
+            StampSlotModuleEpoch(header, slot);
+            slot->entryTimestamp = slot->event.timestamp;
+            call.deferredSlot = slot;
+            PendingEntryTransport = call.transport;
+            PendingEntrySlot = slot;
+            return;
+        }
     }
     else if (!(call.event.flags & Unwound))
         CaptureCoreOutputs(call.event.api, call.event, call.requestedBytes, static_cast<DWORD>(args[2]), slot, header);
+    if (fused)
+    {
+        slot->event.payloadBytes += slot->inputBytes;
+        slot->payloadOffset = 0;
+    }
     call.transport->Publish(slot);
 }
 
@@ -226,6 +280,8 @@ Call::Call(Api api, std::span<const uint64_t> arguments, void* caller, std::span
     ReleaseSRWLockShared(&CaptureLock);
     if (transport)
     {
+        // Materialize any deferred parent entry before publishing nested metadata or calls.
+        FlushPendingEntrySlot();
         if (!observation.clock)
         {
             observation.clock = &CaptureTime;
@@ -297,6 +353,11 @@ extern "C" __declspec(dllexport) void WINAPI DetouristObserveRpcSerialization(ui
     else BeginRpcSerialization(static_cast<Api>(api), arguments);
 }
 
+extern "C" __declspec(dllexport) void WINAPI DetouristFlushPendingEntry() noexcept
+{
+    Detourist::FlushPendingEntrySlot();
+}
+
 void Call::Break(bool leaving)
 {
     if (IsManagedApi(event.api) || mruOnly) return;
@@ -306,6 +367,7 @@ void Call::Break(bool leaving)
     bool matches = exact == static_cast<LONG>(event.api) || (mask & ApiMask(event.api));
     if (!matches ||
         header->stop || !header->debuggerActive) return;
+    if (leaving) FlushPendingEntrySlot();
     auto& breakpoint = header->breakpoint;
 
     // Serialize simultaneous hits while the external controller owns process suspension.
@@ -413,6 +475,11 @@ void Call::ReleaseForContinuation()
     // Context transfer and process termination can abandon this stack without unwinding it.
     ObserverActive = true;
     event.flags |= Continuation;
+    if (deferredSlot && PendingEntrySlot == deferredSlot)
+    {
+        deferredSlot->event.flags |= Continuation;
+        FlushPendingEntrySlot();
+    }
     ParentCall = previousParent;
     CallIdentity = previousIdentity;
     CallDepth = previousDepth;
@@ -653,6 +720,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI DetouristStartInstructions(void* p
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*)
 {
+    if (reason == DLL_THREAD_ATTACH) Detourist::AttachObserverThread();
     if (reason == DLL_THREAD_DETACH) Detourist::DetachObserverThread();
     if (reason == DLL_PROCESS_DETACH) InterlockedExchange(&Detourist::ProcessShuttingDown, 1);
     if (reason == DLL_PROCESS_ATTACH)

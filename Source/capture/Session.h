@@ -26,6 +26,7 @@ struct CaptureOptions
     int32_t exitApi = -1;
     bool followChildren = true;
     bool instructionEngine = false;
+    bool rawPointerProbes = false;
     bool startMinimized = false;
     std::wstring workingDirectory;
 };

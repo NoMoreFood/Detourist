@@ -33,7 +33,7 @@ inline void CaptureWNetRecords(Slot* slot, SharedHeader* header, uint32_t parame
         for (uint32_t field = 0; field < found->stringCount; ++field)
         {
             if (!(stringFields & (1u << field))) continue;
-            if (header->payloadCapacity - slot->event.payloadBytes < sizeof(Value)) return;
+            if (SlotMaxRemaining(slot, header) < sizeof(Value)) return;
             auto member = index * found->bytes + found->stringOffsets[field];
             uint64_t text = 0;
             memcpy(&text, Transport::Payload(slot) + snapshot + sizeof(Value) + member, sizeof(text));

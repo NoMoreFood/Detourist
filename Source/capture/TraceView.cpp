@@ -286,7 +286,11 @@ TraceView::Filter TraceView::Compile(const ViewQuery& query, size_t slot)
     Filter filter;
     filter.category = query.category;
     filter.returnDependent = query.failuresOnly;
-    if (query.target) filter.indexed += " AND c.target=" + std::to_string(query.target);
+    if (query.target)
+    {
+        const bool indexedTarget = query.thread || HasProcessIndex(database_);
+        filter.indexed += (indexedTarget ? " AND c.target=" : " AND +c.target=") + std::to_string(query.target);
+    }
     if (query.thread) filter.indexed += " AND c.tid=" + std::to_string(query.thread);
     std::string residual;
     if (query.failuresOnly) filter.indexed += " AND (c.flags & " + std::to_string(Failed) + ") != 0";
@@ -962,8 +966,8 @@ std::vector<CallRow> TraceView::Fetch(const std::vector<int64_t>& identifiers, b
     if (identifiers.empty()) return rows;
     ReadTransaction transaction(database_);
     rows.reserve(identifiers.size());
-    Statement calls(database_, (CallSelect(false, includeSummary, thread_ != 0, markSql_) +
-        "WHERE c.rowid=?1").c_str());
+    Statement calls(database_, (CallSelect(false, includeSummary, thread_ != 0,
+        HasProcessIndex(database_), markSql_) + "WHERE c.rowid=?1").c_str());
     sqlite3_bind_int(calls.value, 11, static_cast<int>(ApiCategory::Unclassified));
     for (auto identifier : identifiers)
     {
@@ -999,7 +1003,8 @@ std::vector<CallRow> TraceView::Rows(uint64_t index, uint32_t limit, bool includ
         [](uint64_t value, const Checkpoint& checkpoint) { return value < checkpoint.index; });
     bool seek = next != checkpoints_.begin();
     std::string direction = order_ == ViewOrder::Oldest ? "" : " DESC";
-    auto sql = CallSelect(false, includeSummary, thread_ != 0, markSql_) + "WHERE +c.rowid<=?1" + SnapshotWhere();
+    auto sql = CallSelect(false, includeSummary, thread_ != 0, HasProcessIndex(database_), markSql_) +
+        "WHERE +c.rowid<=?1" + SnapshotWhere();
     if (seek) sql += order_ == ViewOrder::Oldest ? " AND (c.started,c.target,c.id)>=(?2,?3,?4)" :
         " AND (c.started,c.target,c.id)<=(?2,?3,?4)";
     sql += " ORDER BY c.started" + direction + ",c.target" + direction + ",c.id" + direction + " LIMIT ?8 OFFSET ?9";

@@ -12,6 +12,9 @@ EXPORTS
     DetouristGetProfilerBridge=_DetouristGetProfilerBridge@8
     DetouristGetObserverContext=_DetouristGetObserverContext@4
     DetouristSetObserverContext=_DetouristSetObserverContext@4
+    DetouristBindObserverThread=_DetouristBindObserverThread@4
+    DetouristFlushPendingEntry=_DetouristFlushPendingEntry@0
     DetouristNativeHookAddresses DATA
     DetouristNativeHookApis DATA
     DetouristInternalCallerRanges DATA
+    DetouristStackImageEpoch DATA

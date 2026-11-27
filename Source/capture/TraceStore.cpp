@@ -196,7 +196,7 @@ TraceStore::TraceStore(const std::wstring& path)
         int pageBytes = 8192;
         SqlCheck(sqlite3_file_control(database_, "main", SQLITE_FCNTL_CHUNK_SIZE, &pageBytes), database_);
         auto schema = "PRAGMA page_size=" + std::to_string(pageBytes) +
-            "; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192;"
+            "; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY;"
             "PRAGMA application_id=" + std::to_string(TraceApplicationId) +
             "; PRAGMA user_version=" + std::to_string(TraceSchemaVersion) + ";"
             "CREATE TABLE session(frequency INTEGER, start_clock INTEGER, start_utc INTEGER, total_calls INTEGER);"
@@ -218,7 +218,6 @@ TraceStore::TraceStore(const std::wstring& path)
             " PRIMARY KEY(target,id));"
             "CREATE TABLE input_blocks(id INTEGER PRIMARY KEY,data BLOB NOT NULL);"
             "CREATE INDEX calls_time ON call_records(started,target,id,api);"
-            "CREATE INDEX calls_process ON call_records(target,started,id,api);"
             "CREATE INDEX calls_thread ON call_records(target,tid,started,id,api);"
             "CREATE INDEX calls_failed ON call_records(started,target,id,api) WHERE (flags & " +
             std::to_string(Failed) + ") != 0;"
@@ -462,10 +461,17 @@ void TraceStore::Finish()
 int64_t TraceStore::AddTarget(uint32_t processId, const std::wstring& image, int64_t parent, uint64_t installedMask,
     uint32_t pointerSize)
 {
+    Flush();
     Statement statement(database_, "INSERT INTO targets(pid,image,parent,installed_mask,state,pointer_size) "
         "VALUES(?,?,?,?, 'Capturing',?)");
     statement.Exec(processId, Utf8(image), parent, installedMask, static_cast<int>(pointerSize));
-    return sqlite3_last_insert_rowid(database_);
+    const auto id = sqlite3_last_insert_rowid(database_);
+    if (id >= 2 && !multiTargetIndexed_)
+    {
+        Execute("CREATE INDEX IF NOT EXISTS calls_process ON call_records(target,started,id,api)");
+        multiTargetIndexed_ = true;
+    }
+    return id;
 }
 
 void TraceStore::TargetState(int64_t target, const std::wstring& state, bool exited)
@@ -656,8 +662,27 @@ void TraceStore::Add(int64_t target, const RecordView& record)
                 std::min(metadata.argumentCount, MaximumArguments);
         return;
     }
-    if ((event.api >= Api::Count && !IsDynamicApi(event.api)) ||
-        (event.kind != EventKind::Enter && event.kind != EventKind::Leave))
+    if (event.api >= Api::Count && !IsDynamicApi(event.api))
+        throw std::runtime_error("Unsupported capture record.");
+    if (event.kind == EventKind::Completed)
+    {
+        if (record.inputBytes > record.payload.size())
+            throw std::runtime_error("Invalid capture record.");
+        Event entryEvent = event;
+        entryEvent.kind = EventKind::Enter;
+        entryEvent.timestamp = record.entryTimestamp;
+        entryEvent.payloadBytes = record.inputBytes;
+        Event leaveEvent = event;
+        leaveEvent.kind = EventKind::Leave;
+        leaveEvent.payloadBytes = static_cast<uint32_t>(record.payload.size()) - record.inputBytes;
+        RecordView entryView{entryEvent, record.payload.first(record.inputBytes)};
+        RecordView leaveView{leaveEvent, record.payload.subspan(record.inputBytes)};
+        WriteEntry(target, entryView, &leaveView);
+        ++count_;
+        if (pending_ >= MaxPendingTransactionOps) Flush();
+        return;
+    }
+    if (event.kind != EventKind::Enter && event.kind != EventKind::Leave)
         throw std::runtime_error("Unsupported capture record.");
 
     // Merge short calls before their scheduled commit, retaining entry visibility for held or blocked calls.
@@ -1086,16 +1111,29 @@ void ResolveCaller(const std::vector<ModuleRow>& modules, CallRow& call)
     }
 }
 
+bool HasProcessIndex(sqlite3* raw)
+{
+    Statement index(raw, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='calls_process'");
+    return index.Next();
+}
+
 // Columns and joins shared by page, detail and view queries; ?11 supplies the unclassified category.
-std::string CallSelect(bool payload, bool summary, bool threadDelta, const std::string& marks)
+std::string CallSelect(bool payload, bool summary, bool threadDelta, bool processIndexed, const std::string& marks)
 {
     // Find predecessor timestamps before applying display filters, keeping deltas stable.
     std::string sql = "SELECT c.target,c.id,t.pid,c.tid,c.api,c.started,c.ended,c.result,c.error,c.flags,c.arguments,";
     sql += payload ? "c.input,c.output," : summary ? "substr(c.input,1,768),substr(c.output,1,768)," : "NULL,NULL,";
-    sql += "c.started-(SELECT p.started FROM calls p WHERE p.target=c.target ";
-    if (threadDelta) sql += "AND p.tid=c.tid ";
-    sql += "AND (p.started,p.id)<(c.started,c.id)"
-        " ORDER BY p.started DESC,p.id DESC LIMIT 1),c.caller,COALESCE(d.module,a.module,''),"
+    if (threadDelta)
+        sql += "c.started-(SELECT p.started FROM calls p WHERE p.target=c.target AND p.tid=c.tid "
+            "AND (p.started,p.id)<(c.started,c.id) ORDER BY p.started DESC,p.id DESC LIMIT 1),";
+    else if (processIndexed)
+        sql += "c.started-(SELECT p.started FROM calls p WHERE p.target=c.target "
+            "AND (p.started,p.id)<(c.started,c.id) ORDER BY p.started DESC,p.id DESC LIMIT 1),";
+    else
+        sql += "c.started-(SELECT p.started FROM calls p WHERE +p.target=c.target "
+            "AND (p.started,p.target,p.id)<(c.started,c.target,c.id) "
+            "ORDER BY p.started DESC,p.target DESC,p.id DESC LIMIT 1),";
+    sql += "c.caller,COALESCE(d.module,a.module,''),"
         "COALESCE(d.name,a.name,'Unknown API'),COALESCE(d.parameters,a.parameters,''),"
         "COALESCE(d.argument_count,a.argument_count,0),COALESCE(d.category,a.category,?11),"
         "c.parent,c.depth,c.rowid," + marks + ",c.module_epoch,t.pointer_size,c.adjusted_duration "
@@ -1195,6 +1233,8 @@ TracePage TraceStore::ReadPage(const std::wstring& path, const Query& query)
     TracePage page;
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(OpenTrace(path, page), sqlite3_close);
     auto raw = database.get();
+    SqlCheck(sqlite3_exec(raw, "BEGIN", nullptr, nullptr, nullptr), raw);
+    const bool processIndexed = HasProcessIndex(raw);
     if (query.includeMetadata)
     {
         ReadTargets(raw, page);
@@ -1203,8 +1243,9 @@ TracePage TraceStore::ReadPage(const std::wstring& path, const Query& query)
         while (threads.Next())
             page.threads.push_back(static_cast<uint32_t>(sqlite3_column_int64(threads.value, 0)));
     }
-    auto sql = CallSelect(query.includePayload, query.includeSummary, query.thread != 0) + "WHERE 1=1 ";
-    if (query.target) sql += "AND c.target=?1 ";
+    auto sql = CallSelect(query.includePayload, query.includeSummary, query.thread != 0, processIndexed) + "WHERE 1=1 ";
+    if (query.target)
+        sql += (query.thread || query.callId || processIndexed) ? "AND c.target=?1 " : "AND +c.target=?1 ";
     if (query.thread) sql += "AND c.tid=?2 ";
     if (query.callId) sql += "AND c.id=?6 ";
 
